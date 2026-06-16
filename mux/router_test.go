@@ -239,3 +239,168 @@ func TestDifferentMethods(t *testing.T) {
 		}
 	}
 }
+
+func TestGlobalAndGroupMiddleware_OnionOrder(t *testing.T) {
+	r := New()
+	order := []int{}
+
+	r.Use(func(c *ctx.Ctx) {
+		order = append(order, 1)
+		c.Next()
+		order = append(order, 8)
+	})
+	r.Use(func(c *ctx.Ctx) {
+		order = append(order, 2)
+		c.Next()
+		order = append(order, 7)
+	})
+
+	api := r.Group("/api", func(c *ctx.Ctx) {
+		order = append(order, 3)
+		c.Next()
+		order = append(order, 6)
+	})
+	api.Use(func(c *ctx.Ctx) {
+		order = append(order, 4)
+		c.Next()
+		order = append(order, 5)
+	})
+	api.GET("/test", func(c *ctx.Ctx) {
+		order = append(order, 100)
+		c.String(http.StatusOK, "ok")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/test", nil)
+	r.ServeHTTP(w, req)
+
+	expected := []int{1, 2, 3, 4, 100, 5, 6, 7, 8}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d steps, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("onion order mismatch at %d: expected %d, got %d\n  full order: %v\n  expected:    %v",
+				i, v, order[i], order, expected)
+		}
+	}
+}
+
+func TestNestedGroups_ThreeLevels(t *testing.T) {
+	r := New()
+	order := []int{}
+
+	r.Use(func(c *ctx.Ctx) {
+		order = append(order, 1)
+		c.Next()
+		order = append(order, 10)
+	})
+
+	api := r.Group("/api", func(c *ctx.Ctx) {
+		order = append(order, 2)
+		c.Next()
+		order = append(order, 9)
+	})
+
+	admin := api.Group("/admin", func(c *ctx.Ctx) {
+		order = append(order, 3)
+		c.Next()
+		order = append(order, 8)
+	})
+
+	dashboard := admin.Group("/dashboard", func(c *ctx.Ctx) {
+		order = append(order, 4)
+		c.Next()
+		order = append(order, 7)
+	})
+
+	dashboard.GET("/stats", func(c *ctx.Ctx) {
+		order = append(order, 100)
+		c.String(http.StatusOK, "ok")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/admin/dashboard/stats", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	expected := []int{1, 2, 3, 4, 100, 7, 8, 9, 10}
+	if len(order) != len(expected) {
+		t.Fatalf("expected %d steps, got %d: %v", len(expected), len(order), order)
+	}
+	for i, v := range expected {
+		if order[i] != v {
+			t.Fatalf("nested onion order mismatch at %d: expected %d, got %d\n  got: %v\n  want: %v",
+				i, v, order[i], order, expected)
+		}
+	}
+}
+
+func TestNestedGroupWithDifferentDepths(t *testing.T) {
+	r := New()
+	order := []int{}
+
+	r.Use(func(c *ctx.Ctx) {
+		order = append(order, 1)
+		c.Next()
+		order = append(order, 6)
+	})
+
+	api := r.Group("/api", func(c *ctx.Ctx) {
+		order = append(order, 2)
+		c.Next()
+		order = append(order, 5)
+	})
+
+	api.GET("/shallow", func(c *ctx.Ctx) {
+		order = append(order, 10)
+		c.String(http.StatusOK, "shallow")
+	})
+
+	deep := api.Group("/deep", func(c *ctx.Ctx) {
+		order = append(order, 3)
+		c.Next()
+		order = append(order, 4)
+	})
+	deep.GET("/route", func(c *ctx.Ctx) {
+		order = append(order, 20)
+		c.String(http.StatusOK, "deep")
+	})
+
+	t.Run("shallow_route", func(t *testing.T) {
+		order = []int{}
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/shallow", nil)
+		r.ServeHTTP(w, req)
+
+		expected := []int{1, 2, 10, 5, 6}
+		if len(order) != len(expected) {
+			t.Fatalf("shallow: expected %d steps, got %d: %v", len(expected), len(order), order)
+		}
+		for i, v := range expected {
+			if order[i] != v {
+				t.Fatalf("shallow: order[%d]=%d, want %d; full=%v", i, order[i], v, order)
+			}
+		}
+	})
+
+	t.Run("deep_route", func(t *testing.T) {
+		order = []int{}
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/deep/route", nil)
+		r.ServeHTTP(w, req)
+
+		expected := []int{1, 2, 3, 20, 4, 5, 6}
+		if len(order) != len(expected) {
+			t.Fatalf("deep: expected %d steps, got %d: %v", len(expected), len(order), order)
+		}
+		for i, v := range expected {
+			if order[i] != v {
+				t.Fatalf("deep: order[%d]=%d, want %d; full=%v", i, order[i], v, order)
+			}
+		}
+	})
+}

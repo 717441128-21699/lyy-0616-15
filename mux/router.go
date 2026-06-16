@@ -8,6 +8,11 @@ import (
 	"github.com/trae-framework/vine/radix"
 )
 
+type routeEntry struct {
+	Handler     ctx.HandlerFunc
+	Middlewares []ctx.HandlerFunc
+}
+
 type Router struct {
 	trees      map[string]*radix.Tree
 	middleware []ctx.HandlerFunc
@@ -18,9 +23,7 @@ func New() *Router {
 	r := &Router{
 		trees: make(map[string]*radix.Tree),
 		notFound: func(c *ctx.Ctx) {
-			c.JSON(http.StatusNotFound, map[string]string{
-				"error": "404 page not found",
-			})
+			c.NotFound("page not found")
 		},
 	}
 	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
@@ -34,23 +37,23 @@ func (r *Router) Use(mw ...ctx.HandlerFunc) {
 }
 
 func (r *Router) GET(path string, handler ctx.HandlerFunc) {
-	r.addRoute("GET", path, handler)
+	r.addRoute("GET", path, handler, nil)
 }
 
 func (r *Router) POST(path string, handler ctx.HandlerFunc) {
-	r.addRoute("POST", path, handler)
+	r.addRoute("POST", path, handler, nil)
 }
 
 func (r *Router) PUT(path string, handler ctx.HandlerFunc) {
-	r.addRoute("PUT", path, handler)
+	r.addRoute("PUT", path, handler, nil)
 }
 
 func (r *Router) DELETE(path string, handler ctx.HandlerFunc) {
-	r.addRoute("DELETE", path, handler)
+	r.addRoute("DELETE", path, handler, nil)
 }
 
 func (r *Router) PATCH(path string, handler ctx.HandlerFunc) {
-	r.addRoute("PATCH", path, handler)
+	r.addRoute("PATCH", path, handler, nil)
 }
 
 func (r *Router) Group(prefix string, handlers ...ctx.HandlerFunc) *Group {
@@ -61,13 +64,17 @@ func (r *Router) Group(prefix string, handlers ...ctx.HandlerFunc) *Group {
 	}
 }
 
-func (r *Router) addRoute(method, path string, handler ctx.HandlerFunc) {
+func (r *Router) addRoute(method, path string, handler ctx.HandlerFunc, middlewares []ctx.HandlerFunc) {
 	tree, ok := r.trees[method]
 	if !ok {
 		tree = radix.NewTree()
 		r.trees[method] = tree
 	}
-	tree.Add(method, path, handler)
+	entry := &routeEntry{
+		Handler:     handler,
+		Middlewares: append([]ctx.HandlerFunc{}, middlewares...),
+	}
+	tree.Add(method, path, entry)
 }
 
 func (r *Router) SetNotFound(handler ctx.HandlerFunc) {
@@ -96,7 +103,7 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	handler, ok := result.Handler.(ctx.HandlerFunc)
+	entry, ok := result.Handler.(*routeEntry)
 	if !ok {
 		r.notFound(c)
 		return
@@ -104,9 +111,10 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
 	c.SetParams(result.Params)
 
-	handlers := make([]ctx.HandlerFunc, 0, len(r.middleware)+1)
+	handlers := make([]ctx.HandlerFunc, 0, len(r.middleware)+len(entry.Middlewares)+1)
 	handlers = append(handlers, r.middleware...)
-	handlers = append(handlers, handler)
+	handlers = append(handlers, entry.Middlewares...)
+	handlers = append(handlers, entry.Handler)
 
 	c.SetHandlers(handlers)
 	c.Next()
@@ -163,26 +171,7 @@ func (g *Group) Group(prefix string, handlers ...ctx.HandlerFunc) *Group {
 
 func (g *Group) addRoute(method, path string, handler ctx.HandlerFunc) {
 	fullPath := g.prefix + path
-
-	if len(g.middlewares) == 0 {
-		g.router.addRoute(method, fullPath, handler)
-		return
-	}
-
-	mws := make([]ctx.HandlerFunc, len(g.middlewares))
-	copy(mws, g.middlewares)
-
-	originalHandler := handler
-	wrappedHandler := func(c *ctx.Ctx) {
-		allHandlers := make([]ctx.HandlerFunc, 0, len(mws)+1)
-		allHandlers = append(allHandlers, mws...)
-		allHandlers = append(allHandlers, originalHandler)
-
-		c.SetHandlers(allHandlers)
-		c.Next()
-	}
-
-	g.router.addRoute(method, fullPath, wrappedHandler)
+	g.router.addRoute(method, fullPath, handler, g.middlewares)
 }
 
 func Default() *Router {

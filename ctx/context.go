@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/trae-framework/vine/errors"
 	"github.com/trae-framework/vine/radix"
 )
 
@@ -164,6 +165,66 @@ func (c *Ctx) HTML(code int, html string) {
 	c.Writer.WriteHeader(code)
 	c.written = true
 	c.Writer.Write([]byte(html))
+}
+
+func (c *Ctx) Error(err *errors.AppError) {
+	c.JSON(err.Code, err)
+}
+
+func (c *Ctx) Errorf(code int, format string, args ...interface{}) {
+	c.JSON(code, errors.Newf(code, format, args...))
+}
+
+func (c *Ctx) BadRequest(message string) {
+	c.JSON(http.StatusBadRequest, errors.BadRequest(message))
+}
+
+func (c *Ctx) BadRequestf(format string, args ...interface{}) {
+	c.JSON(http.StatusBadRequest, errors.BadRequestf(format, args...))
+}
+
+func (c *Ctx) Unauthorized(message string) {
+	c.JSON(http.StatusUnauthorized, errors.Unauthorized(message))
+}
+
+func (c *Ctx) Unauthorizedf(format string, args ...interface{}) {
+	c.JSON(http.StatusUnauthorized, errors.Unauthorizedf(format, args...))
+}
+
+func (c *Ctx) Forbidden(message string) {
+	c.JSON(http.StatusForbidden, errors.Forbidden(message))
+}
+
+func (c *Ctx) Forbiddenf(format string, args ...interface{}) {
+	c.JSON(http.StatusForbidden, errors.Forbiddenf(format, args...))
+}
+
+func (c *Ctx) NotFound(message string) {
+	c.JSON(http.StatusNotFound, errors.NotFound(message))
+}
+
+func (c *Ctx) NotFoundf(format string, args ...interface{}) {
+	c.JSON(http.StatusNotFound, errors.NotFoundf(format, args...))
+}
+
+func (c *Ctx) InternalServerError(message string) {
+	c.JSON(http.StatusInternalServerError, errors.Internal(message))
+}
+
+func (c *Ctx) InternalServerErrorf(format string, args ...interface{}) {
+	c.JSON(http.StatusInternalServerError, errors.Internalf(format, args...))
+}
+
+func (c *Ctx) ValidationError(message string) {
+	c.JSON(http.StatusUnprocessableEntity, errors.Validation(message))
+}
+
+func (c *Ctx) ValidationErrorf(format string, args ...interface{}) {
+	c.JSON(http.StatusUnprocessableEntity, errors.Validationf(format, args...))
+}
+
+func (c *Ctx) Conflict(message string) {
+	c.JSON(http.StatusConflict, errors.Conflict(message))
 }
 
 func (c *Ctx) Bind(obj interface{}) error {

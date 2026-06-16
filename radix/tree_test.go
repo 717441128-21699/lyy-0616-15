@@ -50,7 +50,7 @@ func TestWildcardRoute(t *testing.T) {
 	}
 }
 
-func TestStaticOverParam(t *testing.T) {
+func TestStaticOverParamSameLevel(t *testing.T) {
 	tree := NewTree()
 	staticCalled := false
 	paramCalled := false
@@ -80,6 +80,75 @@ func TestStaticOverParam(t *testing.T) {
 	handler()
 	if !paramCalled {
 		t.Error("param route should match /users/123")
+	}
+}
+
+func TestStaticFallbackToParam(t *testing.T) {
+	tree := NewTree()
+	staticCalled := false
+	paramCalled := false
+
+	tree.Add("GET", "/api/users/settings", func() { staticCalled = true })
+	tree.Add("GET", "/api/:module/:action", func() { paramCalled = true })
+
+	result := tree.Get("GET", "/api/users/settings")
+	if !result.Found {
+		t.Fatal("expected route to be found")
+	}
+	handler := result.Handler.(func())
+	handler()
+	if !staticCalled {
+		t.Error("static route should match /api/users/settings")
+	}
+	if paramCalled {
+		t.Error("param route should NOT match when static hits")
+	}
+
+	staticCalled = false
+	paramCalled = false
+	result = tree.Get("GET", "/api/users/profile")
+	if !result.Found {
+		t.Fatal("expected param route to match /api/users/profile via fallback")
+	}
+	handler = result.Handler.(func())
+	handler()
+	if !paramCalled {
+		t.Error("param route should catch /api/users/profile when static doesn't match")
+	}
+	if staticCalled {
+		t.Error("static route should NOT match /api/users/profile")
+	}
+}
+
+func TestStaticFallbackToParamShorterDepth(t *testing.T) {
+	tree := NewTree()
+	settingsCalled := false
+	moduleCalled := false
+
+	tree.Add("GET", "/api/users/settings", func() { settingsCalled = true })
+	tree.Add("GET", "/api/:module", func() { moduleCalled = true })
+
+	result := tree.Get("GET", "/api/users")
+	if !result.Found {
+		t.Fatal("expected /api/:module to match /api/users")
+	}
+	handler := result.Handler.(func())
+	handler()
+	if !moduleCalled {
+		t.Error("/api/:module should match /api/users via fallback")
+	}
+	if result.Params.ByName("module") != "users" {
+		t.Errorf("expected module=users, got %s", result.Params.ByName("module"))
+	}
+
+	result = tree.Get("GET", "/api/users/settings")
+	if !result.Found {
+		t.Fatal("expected /api/users/settings to match static")
+	}
+	handler = result.Handler.(func())
+	handler()
+	if !settingsCalled {
+		t.Error("static /api/users/settings should match exactly")
 	}
 }
 
@@ -159,6 +228,28 @@ func TestWildcardCatchesAll(t *testing.T) {
 	}
 }
 
+func TestWildcardLowestPriority(t *testing.T) {
+	tree := NewTree()
+	staticCalled := false
+	wildCalled := false
+
+	tree.Add("GET", "/files/special.txt", func() { staticCalled = true })
+	tree.Add("GET", "/files/*rest", func() { wildCalled = true })
+
+	result := tree.Get("GET", "/files/special.txt")
+	if !result.Found {
+		t.Fatal("expected route to be found")
+	}
+	handler := result.Handler.(func())
+	handler()
+	if !staticCalled {
+		t.Error("static should win over wildcard for exact match")
+	}
+	if wildCalled {
+		t.Error("wildcard should NOT be called when static matches")
+	}
+}
+
 func TestRouteConflict(t *testing.T) {
 	defer func() {
 		r := recover()
@@ -170,6 +261,40 @@ func TestRouteConflict(t *testing.T) {
 	tree := NewTree()
 	tree.Add("GET", "/hello", func() {})
 	tree.Add("GET", "/hello", func() {})
+}
+
+func TestComplexBacktrack(t *testing.T) {
+	tree := NewTree()
+	deepStatic := false
+	shallowParam := false
+
+	tree.Add("GET", "/a/b/c/d/e", func() { deepStatic = true })
+	tree.Add("GET", "/a/b/:x/:y", func() { shallowParam = true })
+
+	result := tree.Get("GET", "/a/b/c/d/e")
+	if !result.Found {
+		t.Fatal("expected deep static to match")
+	}
+	result.Handler.(func())()
+	if !deepStatic {
+		t.Error("deep static should match exactly")
+	}
+
+	deepStatic = false
+	result = tree.Get("GET", "/a/b/c/d")
+	if !result.Found {
+		t.Fatal("expected shallow param to match via fallback")
+	}
+	result.Handler.(func())()
+	if !shallowParam {
+		t.Error("param route should catch /a/b/c/d when deep static has no handler at that depth")
+	}
+	if result.Params.ByName("x") != "c" {
+		t.Errorf("expected x=c, got %s", result.Params.ByName("x"))
+	}
+	if result.Params.ByName("y") != "d" {
+		t.Errorf("expected y=d, got %s", result.Params.ByName("y"))
+	}
 }
 
 func BenchmarkStaticRoute(b *testing.B) {
@@ -192,7 +317,46 @@ func BenchmarkParamRoute(b *testing.B) {
 	}
 }
 
-func BenchmarkManyRoutes(b *testing.B) {
+func BenchmarkManySiblingRoutes_First(b *testing.B) {
+	tree := NewTree()
+	const N = 1000
+	for i := 0; i < N; i++ {
+		tree.Add("GET", fmt.Sprintf("/api/r%d", i), func() {})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tree.Get("GET", "/api/r0")
+	}
+}
+
+func BenchmarkManySiblingRoutes_Middle(b *testing.B) {
+	tree := NewTree()
+	const N = 1000
+	for i := 0; i < N; i++ {
+		tree.Add("GET", fmt.Sprintf("/api/r%d", i), func() {})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tree.Get("GET", "/api/r500")
+	}
+}
+
+func BenchmarkManySiblingRoutes_Last(b *testing.B) {
+	tree := NewTree()
+	const N = 1000
+	for i := 0; i < N; i++ {
+		tree.Add("GET", fmt.Sprintf("/api/r%d", i), func() {})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tree.Get("GET", "/api/r999")
+	}
+}
+
+func BenchmarkManyDeepRoutes(b *testing.B) {
 	tree := NewTree()
 	for i := 0; i < 1000; i++ {
 		tree.Add("GET", fmt.Sprintf("/api/v1/r%d/item%d", i, i), func() {})
@@ -202,5 +366,18 @@ func BenchmarkManyRoutes(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		tree.Get("GET", "/users/42/posts/99")
+	}
+}
+
+func BenchmarkTenThousandRoutes(b *testing.B) {
+	tree := NewTree()
+	const N = 10000
+	for i := 0; i < N; i++ {
+		tree.Add("GET", fmt.Sprintf("/resources/type-%d/items/%d", i%100, i), func() {})
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tree.Get("GET", "/resources/type-50/items/5000")
 	}
 }
