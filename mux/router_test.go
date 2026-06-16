@@ -1136,3 +1136,276 @@ func TestErrorHandler_RequestIdMethodPath(t *testing.T) {
 		t.Fatalf("want code=404, got %v", resp["code"])
 	}
 }
+
+func TestGetRequests_RequestId_Duration(t *testing.T) {
+	r := New()
+	r.Use(middleware.RequestID())
+
+	r.GET("/ok", func(c *ctx.Ctx) {
+		c.String(http.StatusOK, "ok")
+	})
+	r.GET("/err", func(c *ctx.Ctx) {
+		c.BadRequest("nope")
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/ok", nil))
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/err", nil))
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/never-exists", nil))
+
+	all := r.GetRequests()
+	if len(all) != 3 {
+		t.Fatalf("want 3 recent requests, got %d", len(all))
+	}
+
+	t.Run("status_and_path", func(t *testing.T) {
+		if all[0].StatusCode != 200 || all[0].Path != "/ok" {
+			t.Fatalf("req[0] wrong: %+v", all[0])
+		}
+		if all[1].StatusCode != 400 || all[1].Path != "/err" || !all[1].HasError {
+			t.Fatalf("req[1] wrong: %+v", all[1])
+		}
+		if all[2].StatusCode != 404 || all[2].Path != "/never-exists" {
+			t.Fatalf("req[2] wrong: %+v", all[2])
+		}
+	})
+
+	t.Run("request_id_matches_middleware", func(t *testing.T) {
+		for i, req := range all {
+			if req.RequestID == "" {
+				t.Fatalf("req[%d] has empty request_id", i)
+			}
+		}
+	})
+
+	t.Run("duration_recorded", func(t *testing.T) {
+		for i, req := range all {
+			if req.DurationMs < 0 {
+				t.Fatalf("req[%d] negative duration: %d", i, req.DurationMs)
+			}
+		}
+	})
+
+	t.Run("error_message_captured", func(t *testing.T) {
+		if all[1].ErrorMsg != "nope" {
+			t.Fatalf("req[1] ErrorMsg want 'nope', got %q", all[1].ErrorMsg)
+		}
+	})
+}
+
+func TestMetrics_Accurate_Count_WithAllRequestTypes(t *testing.T) {
+	r := New()
+
+	r.GET("/ok", func(c *ctx.Ctx) { c.String(http.StatusOK, "ok") })
+
+	w := httptest.NewRecorder()
+	for i := 0; i < 5; i++ {
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/ok", nil))
+	}
+	for i := 0; i < 3; i++ {
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/not-here", nil))
+	}
+	r.ServeHTTP(w, httptest.NewRequest("OPTIONS", "/anything", nil))
+	r.ServeHTTP(w, httptest.NewRequest("OPTIONS", "/not-here-either", nil))
+	r.ServeHTTP(w, httptest.NewRequest("HEAD", "/ok", nil))
+
+	m := r.GetMetrics()
+
+	expectedTotal := uint64(5 + 3 + 2 + 1)
+	if m.TotalRequests != expectedTotal {
+		t.Fatalf("total_requests: want %d, got %d", expectedTotal, m.TotalRequests)
+	}
+
+	if m.StatusCounts["200"] != 6 {
+		t.Fatalf("200 count: want 6 (5xGET + 1xHEAD), got %d", m.StatusCounts["200"])
+	}
+	if m.StatusCounts["404"] != 3 {
+		t.Fatalf("404 count: want 3, got %d", m.StatusCounts["404"])
+	}
+	if m.StatusCounts["204"] != 2 {
+		t.Fatalf("204 (OPTIONS) count: want 2, got %d", m.StatusCounts["204"])
+	}
+
+	totalStatus := 0
+	for _, v := range m.StatusCounts {
+		totalStatus += v
+	}
+	if uint64(totalStatus) != expectedTotal {
+		t.Fatalf("sum(status_counts)=%d != total_requests=%d (diff=%d)",
+			totalStatus, expectedTotal, expectedTotal-uint64(totalStatus))
+	}
+}
+
+func TestMetrics_Consecutive404_ShowUp(t *testing.T) {
+	r := New()
+	for i := 0; i < 4; i++ {
+		w := httptest.NewRecorder()
+		path := fmt.Sprintf("/ghost-%d", i)
+		r.ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+	}
+
+	m := r.GetMetrics()
+	if m.StatusCounts["404"] != 4 {
+		t.Fatalf("want 4x404, got %d", m.StatusCounts["404"])
+	}
+	if len(m.RecentErrors) < 4 {
+		t.Fatalf("want >=4 recent errors, got %d", len(m.RecentErrors))
+	}
+	reqs := r.GetRequests()
+	if len(reqs) != 4 {
+		t.Fatalf("want 4 requests, got %d", len(reqs))
+	}
+	for _, rq := range reqs {
+		if rq.StatusCode != 404 || !rq.HasError {
+			t.Fatalf("all should be 404 errors, got %+v", rq)
+		}
+	}
+}
+
+func TestListRoutesFiltered_AllDimensions(t *testing.T) {
+	r := New()
+	r.Use(middleware.Logger())
+
+	r.GET("/public/home", func(c *ctx.Ctx) {})
+	r.POST("/public/contact", func(c *ctx.Ctx) {})
+
+	api := r.Group("/api", middleware.Auth(""))
+	api.GET("/me", func(c *ctx.Ctx) {})
+	api.POST("/orders", func(c *ctx.Ctx) {})
+
+	admin := api.Group("/admin", middleware.Auth("admin"))
+	admin.GET("/stats", func(c *ctx.Ctx) {})
+
+	t.Run("filter_method_only", func(t *testing.T) {
+		posts := r.ListRoutesFiltered(RouteFilter{Method: "POST"})
+		if len(posts) != 2 {
+			t.Fatalf("want 2 POST routes, got %d", len(posts))
+		}
+		for _, rt := range posts {
+			if rt.Method != "POST" {
+				t.Fatalf("non-POST in result: %+v", rt)
+			}
+		}
+	})
+
+	t.Run("filter_prefix_api", func(t *testing.T) {
+		apiRoutes := r.ListRoutesFiltered(RouteFilter{PathPrefix: "/api"})
+		if len(apiRoutes) != 3 {
+			t.Fatalf("want 3 /api routes, got %d", len(apiRoutes))
+		}
+		for _, rt := range apiRoutes {
+			if !strings.HasPrefix(rt.Path, "/api") {
+				t.Fatalf("non-api in result: %+v", rt)
+			}
+		}
+	})
+
+	t.Run("filter_prefix_admin_nested", func(t *testing.T) {
+		adminRoutes := r.ListRoutesFiltered(RouteFilter{PathPrefix: "/api/admin"})
+		if len(adminRoutes) != 1 {
+			t.Fatalf("want 1 admin route, got %d", len(adminRoutes))
+		}
+		if adminRoutes[0].Path != "/api/admin/stats" {
+			t.Fatalf("want /api/admin/stats, got %s", adminRoutes[0].Path)
+		}
+		if adminRoutes[0].GroupMwCount != 2 {
+			t.Fatalf("admin route should have 2 group mw, got %d", adminRoutes[0].GroupMwCount)
+		}
+	})
+
+	t.Run("filter_middleware_auth", func(t *testing.T) {
+		withAuth := r.ListRoutesFiltered(RouteFilter{ContainsMiddleware: "Auth"})
+		if len(withAuth) != 3 {
+			t.Fatalf("want 3 routes with Auth mw, got %d: %+v", len(withAuth), withAuth)
+		}
+	})
+
+	t.Run("filter_method_and_prefix", func(t *testing.T) {
+		res := r.ListRoutesFiltered(RouteFilter{Method: "GET", PathPrefix: "/public"})
+		if len(res) != 1 || res[0].Path != "/public/home" {
+			t.Fatalf("want [GET /public/home], got %+v", res)
+		}
+	})
+
+	t.Run("filter_nomatch", func(t *testing.T) {
+		res := r.ListRoutesFiltered(RouteFilter{PathPrefix: "/nope"})
+		if len(res) != 0 {
+			t.Fatalf("want empty, got %d", len(res))
+		}
+	})
+}
+
+func TestPrintRoutesFiltered_ShowsFilterHeader(t *testing.T) {
+	r := New()
+	r.Use(middleware.RequestID())
+	r.GET("/x", func(c *ctx.Ctx) {})
+
+	all := r.PrintRoutes()
+	if !strings.Contains(all, "Registered Routes") {
+		t.Fatalf("PrintRoutes should contain header, got:\n%s", all)
+	}
+
+	filtered := r.PrintRoutesFiltered(RouteFilter{PathPrefix: "/api"})
+	if !strings.Contains(filtered, "(no routes matched)") {
+		t.Fatalf("PrintRoutesFiltered should say no matches, got:\n%s", filtered)
+	}
+	if !strings.Contains(filtered, "prefix=") {
+		t.Fatalf("PrintRoutesFiltered should show filter info, got:\n%s", filtered)
+	}
+}
+
+func TestDebugRoutes_NeedBearerAdmin(t *testing.T) {
+	r := New()
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		c.JSON(appErr.Code, appErr)
+	})
+
+	debug := r.Group("/debug", middleware.Auth("admin"))
+	debug.GET("/metrics", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"ok": "true"})
+	})
+
+	api := r.Group("/api", middleware.Auth(""))
+	api.GET("/health", func(c *ctx.Ctx) {
+		c.String(http.StatusOK, "ok")
+	})
+
+	t.Run("debug_no_token_401", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("GET", "/debug/metrics", nil))
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("debug no token: want 401, got %d", w.Code)
+		}
+	})
+
+	t.Run("debug_user_403", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/debug/metrics", nil)
+		req.Header.Set("Authorization", "Bearer alice")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("debug user: want 403, got %d", w.Code)
+		}
+	})
+
+	t.Run("debug_admin_200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/debug/metrics", nil)
+		req.Header.Set("Authorization", "Bearer admin")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("debug admin: want 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("api_user_200_not_affected", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/health", nil)
+		req.Header.Set("Authorization", "Bearer alice")
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("api user should still work, got %d", w.Code)
+		}
+	})
+}

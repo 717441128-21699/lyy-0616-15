@@ -32,6 +32,17 @@ type recentError struct {
 	Method  string    `json:"method"`
 }
 
+type recentRequest struct {
+	Time       time.Time `json:"time"`
+	RequestID  string    `json:"request_id"`
+	Method     string    `json:"method"`
+	Path       string    `json:"path"`
+	StatusCode int       `json:"status_code"`
+	DurationMs int64     `json:"duration_ms"`
+	HasError   bool      `json:"has_error"`
+	ErrorMsg   string    `json:"error_msg,omitempty"`
+}
+
 type Metrics struct {
 	RouteCount      int            `json:"route_count"`
 	TotalRequests   uint64         `json:"total_requests"`
@@ -41,7 +52,14 @@ type Metrics struct {
 	StartedAt       time.Time      `json:"started_at"`
 }
 
+type RouteFilter struct {
+	Method           string `json:"method,omitempty"`
+	PathPrefix       string `json:"path_prefix,omitempty"`
+	ContainsMiddleware string `json:"contains_middleware,omitempty"`
+}
+
 const recentErrorsLimit = 20
+const recentRequestsLimit = 50
 
 type Router struct {
 	trees        map[string]*radix.Tree
@@ -49,12 +67,14 @@ type Router struct {
 	notFound     ctx.HandlerFunc
 	errorHandler ErrorHandlerFunc
 
-	metricsMu       sync.Mutex
-	startedAt       time.Time
-	totalRequests   uint64
-	statusCounts    map[string]int
-	recentErrorsBuf []recentError
-	recentErrorsPtr int
+	metricsMu         sync.Mutex
+	startedAt         time.Time
+	totalRequests     uint64
+	statusCounts      map[string]int
+	recentErrorsBuf   []recentError
+	recentErrorsPtr   int
+	recentRequestsBuf []recentRequest
+	recentRequestsPtr int
 }
 
 func defaultErrorHandler(c *ctx.Ctx, err error) {
@@ -68,10 +88,11 @@ func New() *Router {
 		notFound: func(c *ctx.Ctx) {
 			c.NotFound("page not found")
 		},
-		errorHandler:    defaultErrorHandler,
-		statusCounts:    make(map[string]int),
-		recentErrorsBuf: make([]recentError, 0, recentErrorsLimit),
-		startedAt:       time.Now(),
+		errorHandler:      defaultErrorHandler,
+		statusCounts:      make(map[string]int),
+		recentErrorsBuf:   make([]recentError, 0, recentErrorsLimit),
+		recentRequestsBuf: make([]recentRequest, 0, recentRequestsLimit),
+		startedAt:         time.Now(),
 	}
 	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
 		r.trees[method] = radix.NewTree()
@@ -174,22 +195,47 @@ func (r *Router) SetNotFound(handler ctx.HandlerFunc) {
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	origMethod := req.Method
 	path := req.URL.Path
+	start := time.Now()
 
 	c := ctx.New(w, req)
 	defer c.Release()
 
+	hadError := false
+	var errorMsg string
+
 	c.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		hadError = true
 		appErr := errors.FromError(err)
+		errorMsg = appErr.Message
 		r.recordError(appErr.Code, appErr.Message, path, origMethod)
 		r.errorHandler(c, err)
 	})
 
-	var headFallback bool
-	targetMethod := origMethod
+	atomic.AddUint64(&r.totalRequests, 1)
 
-	if origMethod == "HEAD" {
-		if _, hasTree := r.trees["HEAD"]; hasTree {
-			if tree := r.trees["HEAD"]; tree != nil {
+	var finalStatus int
+
+	defer func() {
+		dur := time.Since(start)
+		status := finalStatus
+		if status == 0 {
+			status = c.StatusCode()
+		}
+		if status == 0 {
+			status = http.StatusOK
+		}
+		rid, _ := c.Get("request_id")
+		ridStr, _ := rid.(string)
+		r.recordStatus(status)
+		r.recordRequest(ridStr, origMethod, path, status, dur, hadError, errorMsg)
+	}()
+
+	dispatch := func(c *ctx.Ctx) {
+		var headFallback bool
+		targetMethod := origMethod
+
+		if origMethod == "HEAD" {
+			if tree, hasTree := r.trees["HEAD"]; hasTree && tree != nil {
 				if res := tree.Get("HEAD", path); !res.Found {
 					targetMethod = "GET"
 					headFallback = true
@@ -199,86 +245,89 @@ func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 				headFallback = true
 			}
 		}
-	}
 
-	useMethod := targetMethod
-	tree, ok := r.trees[useMethod]
-	if !ok {
-		if origMethod == "OPTIONS" {
-			r.handleOptionsFallback(c)
+		useMethod := targetMethod
+		tree, ok := r.trees[useMethod]
+		if !ok {
+			if origMethod == "OPTIONS" {
+				r.handleOptionsFallback(c, &finalStatus)
+				return
+			}
+			r.notFound(c)
+			finalStatus = c.StatusCode()
 			return
 		}
-		r.notFound(c)
-		r.recordStatus(c.StatusCode())
-		return
-	}
 
-	result := tree.Get(useMethod, path)
-	if !result.Found {
-		if origMethod == "OPTIONS" && useMethod == "OPTIONS" {
-			r.handleOptionsFallback(c)
+		result := tree.Get(useMethod, path)
+		if !result.Found {
+			if origMethod == "OPTIONS" && useMethod == "OPTIONS" {
+				r.handleOptionsFallback(c, &finalStatus)
+				return
+			}
+			if result.TSR {
+				c.JSON(http.StatusMovedPermanently, map[string]string{
+					"redirect": result.TSRPath,
+				})
+				finalStatus = http.StatusMovedPermanently
+				return
+			}
+			r.notFound(c)
+			finalStatus = c.StatusCode()
 			return
 		}
+
+		entry, ok := result.Handler.(*routeEntry)
+		if !ok {
+			r.notFound(c)
+			finalStatus = c.StatusCode()
+			return
+		}
+
+		c.SetParams(result.Params)
+
+		handlers := make([]ctx.HandlerFunc, 0, len(entry.Middlewares)+1)
+		handlers = append(handlers, entry.Middlewares...)
+		handlers = append(handlers, entry.Handler)
+
+		c.SetHandlers(handlers)
+
 		if headFallback {
-		}
-		if result.TSR {
-			c.JSON(http.StatusMovedPermanently, map[string]string{
-				"redirect": result.TSRPath,
-			})
-			r.recordStatus(c.StatusCode())
+			cw := &captureWriter{inner: w}
+			c.Writer = cw
+			c.Next()
+			status := cw.status
+			if status == 0 {
+				status = c.StatusCode()
+			}
+			if status == 0 {
+				status = http.StatusOK
+			}
+			w.WriteHeader(status)
+			finalStatus = status
 			return
 		}
-		r.notFound(c)
-		r.recordStatus(c.StatusCode())
-		return
-	}
 
-	entry, ok := result.Handler.(*routeEntry)
-	if !ok {
-		r.notFound(c)
-		r.recordStatus(c.StatusCode())
-		return
-	}
-
-	c.SetParams(result.Params)
-
-	handlers := make([]ctx.HandlerFunc, 0, len(r.middleware)+len(entry.Middlewares)+1)
-	handlers = append(handlers, r.middleware...)
-	handlers = append(handlers, entry.Middlewares...)
-	handlers = append(handlers, entry.Handler)
-
-	c.SetHandlers(handlers)
-	atomic.AddUint64(&r.totalRequests, 1)
-
-	if headFallback {
-		cw := &captureWriter{inner: w}
-		c.Writer = cw
 		c.Next()
-		status := cw.status
-		if status == 0 {
-			status = c.StatusCode()
-		}
-		if status == 0 {
-			status = http.StatusOK
-		}
-		w.WriteHeader(status)
-		r.recordStatus(status)
-		return
+		finalStatus = c.StatusCode()
 	}
 
+	chain := make([]ctx.HandlerFunc, 0, len(r.middleware)+1)
+	chain = append(chain, r.middleware...)
+	chain = append(chain, dispatch)
+	c.SetHandlers(chain)
 	c.Next()
-	r.recordStatus(c.StatusCode())
 }
 
-func (r *Router) handleOptionsFallback(c *ctx.Ctx) {
+func (r *Router) handleOptionsFallback(c *ctx.Ctx, finalStatus *int) {
 	c.Header("Access-Control-Allow-Origin", "*")
 	c.Header("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,PATCH,HEAD,OPTIONS")
 	c.Header("Access-Control-Allow-Headers", "Content-Type,Authorization")
 	c.Header("Access-Control-Max-Age", "86400")
 	c.Status(http.StatusNoContent)
 	c.Writer.WriteHeader(http.StatusNoContent)
-	atomic.AddUint64(&r.totalRequests, 1)
-	r.recordStatus(http.StatusNoContent)
+	if finalStatus != nil {
+		*finalStatus = http.StatusNoContent
+	}
 }
 
 type captureWriter struct {
@@ -322,6 +371,27 @@ func (r *Router) recordStatus(code int) {
 	r.metricsMu.Unlock()
 }
 
+func (r *Router) recordRequest(rid, method, path string, status int, dur time.Duration, hasErr bool, errMsg string) {
+	entry := recentRequest{
+		Time:       time.Now(),
+		RequestID:  rid,
+		Method:     method,
+		Path:       path,
+		StatusCode: status,
+		DurationMs: dur.Milliseconds(),
+		HasError:   hasErr,
+		ErrorMsg:   errMsg,
+	}
+	r.metricsMu.Lock()
+	if len(r.recentRequestsBuf) < recentRequestsLimit {
+		r.recentRequestsBuf = append(r.recentRequestsBuf, entry)
+	} else {
+		r.recentRequestsBuf[r.recentRequestsPtr] = entry
+		r.recentRequestsPtr = (r.recentRequestsPtr + 1) % recentRequestsLimit
+	}
+	r.metricsMu.Unlock()
+}
+
 func (r *Router) recordError(code int, msg, path, method string) {
 	r.metricsMu.Lock()
 	if len(r.recentErrorsBuf) < recentErrorsLimit {
@@ -336,6 +406,25 @@ func (r *Router) recordError(code int, msg, path, method string) {
 	}
 	r.recentErrorsPtr = (r.recentErrorsPtr + 1) % recentErrorsLimit
 	r.metricsMu.Unlock()
+}
+
+func (r *Router) GetRequests() []recentRequest {
+	r.metricsMu.Lock()
+	defer r.metricsMu.Unlock()
+
+	n := len(r.recentRequestsBuf)
+	recent := make([]recentRequest, 0, n)
+	if n == recentRequestsLimit {
+		for i := 0; i < n; i++ {
+			idx := (r.recentRequestsPtr + i) % n
+			recent = append(recent, r.recentRequestsBuf[idx])
+		}
+	} else {
+		for i := 0; i < n; i++ {
+			recent = append(recent, r.recentRequestsBuf[i])
+		}
+	}
+	return recent
 }
 
 func (r *Router) GetMetrics() Metrics {
@@ -396,14 +485,53 @@ type RouteInfo struct {
 }
 
 func (r *Router) ListRoutes() []RouteInfo {
+	return r.ListRoutesFiltered(RouteFilter{})
+}
+
+func containsCaseInsensitive(s, substr string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(substr))
+}
+
+func (r *Router) ListRoutesFiltered(f RouteFilter) []RouteInfo {
 	var routes []RouteInfo
 	globalNames := handlerNames(r.middleware)
+	filterMethod := strings.ToUpper(strings.TrimSpace(f.Method))
+	filterPrefix := strings.TrimSpace(f.PathPrefix)
+	filterMw := strings.TrimSpace(f.ContainsMiddleware)
+
 	for method, tree := range r.trees {
+		if filterMethod != "" && method != filterMethod {
+			continue
+		}
 		entries := tree.Walk()
 		for _, e := range entries {
 			entry, ok := e.Handler.(*routeEntry)
 			if !ok {
 				continue
+			}
+			if filterPrefix != "" && !strings.HasPrefix(e.Path, filterPrefix) {
+				continue
+			}
+			groupNames := handlerNames(entry.Middlewares)
+			if filterMw != "" {
+				found := false
+				for _, name := range globalNames {
+					if containsCaseInsensitive(name, filterMw) {
+						found = true
+						break
+					}
+				}
+				if !found {
+					for _, name := range groupNames {
+						if containsCaseInsensitive(name, filterMw) {
+							found = true
+							break
+						}
+					}
+				}
+				if !found {
+					continue
+				}
 			}
 			routes = append(routes, RouteInfo{
 				Method:        method,
@@ -413,7 +541,7 @@ func (r *Router) ListRoutes() []RouteInfo {
 				TotalMwCount:  len(r.middleware) + len(entry.Middlewares),
 				HasHandler:    entry.Handler != nil,
 				GlobalMwNames: append([]string{}, globalNames...),
-				GroupMwNames:  handlerNames(entry.Middlewares),
+				GroupMwNames:  groupNames,
 				HandlerName:   funcName(entry.Handler),
 			})
 		}
@@ -428,13 +556,26 @@ func (r *Router) ListRoutes() []RouteInfo {
 }
 
 func (r *Router) PrintRoutes() string {
-	routes := r.ListRoutes()
+	return r.PrintRoutesFiltered(RouteFilter{})
+}
+
+func (r *Router) PrintRoutesFiltered(f RouteFilter) string {
+	routes := r.ListRoutesFiltered(f)
 	if len(routes) == 0 {
-		return "(no routes registered)"
+		extra := ""
+		if f.Method != "" || f.PathPrefix != "" || f.ContainsMiddleware != "" {
+			extra = fmt.Sprintf(" (filter: method=%q prefix=%q mw=%q)",
+				f.Method, f.PathPrefix, f.ContainsMiddleware)
+		}
+		return "(no routes matched)" + extra
 	}
 
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("Registered Routes (total: %d, global middleware: %d)\n", len(routes), len(r.middleware)))
+	if f.Method != "" || f.PathPrefix != "" || f.ContainsMiddleware != "" {
+		sb.WriteString(fmt.Sprintf("  Filter: method=%q prefix=%q middleware=%q\n",
+			f.Method, f.PathPrefix, f.ContainsMiddleware))
+	}
 	if len(r.middleware) > 0 {
 		sb.WriteString(fmt.Sprintf("  Global: %s\n", strings.Join(handlerNames(r.middleware), " -> ")))
 	}

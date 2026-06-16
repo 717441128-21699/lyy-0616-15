@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/trae-framework/vine/ctx"
@@ -75,29 +76,60 @@ func main() {
 	r.Use(middleware.CORS("*"))
 	r.Use(middleware.Timing())
 
-	r.GET("/", homeHandler)
-	r.GET("/health", healthHandler)
-	r.GET("/panic", panicHandler)
-
-	r.GET("/debug/routes", func(c *ctx.Ctx) {
+	debug := r.Group("/debug", middleware.Auth("admin"))
+	debug.GET("/routes", func(c *ctx.Ctx) {
+		filter := mux.RouteFilter{
+			Method:             c.Query("method"),
+			PathPrefix:         c.Query("prefix"),
+			ContainsMiddleware: c.Query("with_mw"),
+		}
+		filtered := r.ListRoutesFiltered(filter)
 		c.JSON(http.StatusOK, map[string]interface{}{
 			"success": true,
 			"data": map[string]interface{}{
-				"routes":       r.ListRoutes(),
-				"routes_count": len(r.ListRoutes()),
+				"filter":       filter,
+				"routes":       filtered,
+				"routes_count": len(filtered),
 			},
 		})
 	})
-	r.GET("/debug/metrics", func(c *ctx.Ctx) {
+	debug.GET("/routes/print", func(c *ctx.Ctx) {
+		filter := mux.RouteFilter{
+			Method:             c.Query("method"),
+			PathPrefix:         c.Query("prefix"),
+			ContainsMiddleware: c.Query("with_mw"),
+		}
+		c.String(http.StatusOK, "%s", r.PrintRoutesFiltered(filter))
+	})
+	debug.GET("/metrics", func(c *ctx.Ctx) {
 		m := r.GetMetrics()
 		c.JSON(http.StatusOK, map[string]interface{}{
 			"success": true,
 			"data":    m,
 		})
 	})
-	r.GET("/debug/routes/print", func(c *ctx.Ctx) {
-		c.String(http.StatusOK, "%s", r.PrintRoutes())
+	debug.GET("/requests", func(c *ctx.Ctx) {
+		limit := c.QueryInt("limit", 20)
+		if limit <= 0 {
+			limit = 20
+		}
+		all := r.GetRequests()
+		if limit < len(all) {
+			all = all[len(all)-limit:]
+		}
+		c.JSON(http.StatusOK, map[string]interface{}{
+			"success": true,
+			"data": map[string]interface{}{
+				"requests":      all,
+				"requests_count": len(all),
+				"limit":         limit,
+			},
+		})
 	})
+
+	r.GET("/", homeHandler)
+	r.GET("/health", healthHandler)
+	r.GET("/panic", panicHandler)
 
 	r.GET("/users", listUsersHandler)
 	r.GET("/users/:id", getUserHandler)
@@ -139,69 +171,66 @@ func main() {
 	fmt.Println()
 	fmt.Println(r.PrintRoutes())
 	fmt.Println()
-	fmt.Println("=== 调试接口 ===")
-	fmt.Println("  GET    /debug/routes               - 路由表 (JSON, 含中间件名称)")
-	fmt.Println("  GET    /debug/routes/print         - 路由表 (表格 + 中间件链)")
-	fmt.Println("  GET    /debug/metrics              - 运行指标 (请求数/状态码/最近错误)")
+	fmt.Println("=== 调试接口 (全部需要 Bearer admin, 状态码 401/403) ===")
+	fmt.Println("  GET    /debug/routes?method=GET&prefix=/api&with_mw=Auth")
+	fmt.Println("         - 支持过滤: method / prefix / with_mw (按中间件名包含匹配)")
+	fmt.Println("  GET    /debug/routes/print?prefix=/api/v1/admin")
+	fmt.Println("         - 命令行友好的表格, 支持同样的过滤参数")
+	fmt.Println("  GET    /debug/metrics")
+	fmt.Println("         - route_count / total_requests / status_counts / recent_errors / uptime")
+	fmt.Println("  GET    /debug/requests?limit=30")
+	fmt.Println("         - 最近请求: request_id / method / path / status / duration_ms / has_error")
 	fmt.Println()
 	fmt.Println("=== 基础路由 ===")
 	fmt.Println("  GET    /                           - 首页")
 	fmt.Println("  GET    /health                     - 健康检查")
-	fmt.Println("  GET    /panic                      - Panic 恢复测试 (走全局错误处理器)")
+	fmt.Println("  GET    /panic                      - Panic 恢复测试")
 	fmt.Println()
-	fmt.Println("=== 用户 CRUD (参数路由) ===")
+	fmt.Println("=== 用户 CRUD ===")
 	fmt.Println("  GET    /users                      - 列表")
 	fmt.Println("  GET    /users/:id                  - 详情 (NotFound 统一格式, 带 request_id)")
-	fmt.Println("  POST   /users                      - 创建 (参数校验)")
+	fmt.Println("  POST   /users                      - 创建")
 	fmt.Println("  PUT    /users/:id                  - 更新")
 	fmt.Println("  DELETE /users/:id                  - 删除")
-	fmt.Println("  HEAD   /users/:id                  - HEAD 自动复用 GET handler, 无 body")
+	fmt.Println("  HEAD   /users/:id                  - 自动复用 GET handler, 无 body")
 	fmt.Println()
 	fmt.Println("=== 嵌套路由组 + 中间件 (区分 401/403) ===")
-	fmt.Println("  无 token → 401 (未认证)")
-	fmt.Println("  Bearer alice → 普通用户, /api/v1/* 可访问, /admin → 403")
-	fmt.Println("  Bearer admin → 管理员, 所有接口可访问")
+	fmt.Println("  无 token                             → 401 Unauthorized")
+	fmt.Println("  Bearer alice (普通用户)              → /api/v1/* 可访问, /api/v1/admin/* → 403")
+	fmt.Println("  Bearer admin (管理员)                → 所有接口 (含 /debug/*) 可访问")
 	fmt.Println()
 	fmt.Println("  GET    /api/v1/profile             - 个人信息")
 	fmt.Println("  GET    /api/v1/settings            - 设置")
 	fmt.Println("  GET    /api/v1/orders              - 订单列表")
 	fmt.Println("  GET    /api/v1/orders/:id          - 订单详情")
 	fmt.Println("  POST   /api/v1/orders              - 创建订单")
-	fmt.Println("  GET    /api/v1/admin/dashboard     - 管理后台 (需 admin 角色)")
-	fmt.Println("  GET    /api/v1/admin/users         - 用户管理 (需 admin 角色)")
+	fmt.Println("  GET    /api/v1/admin/dashboard     - 管理后台")
+	fmt.Println("  GET    /api/v1/admin/users         - 用户管理")
 	fmt.Println()
 	fmt.Println("=== CORS 预检 (OPTIONS, 无需手动注册) ===")
-	fmt.Println("  OPTIONS /any/route                 - 返回 204 + CORS 头")
+	fmt.Println("  OPTIONS /any/route                 → 204 No Content + CORS 头")
 	fmt.Println()
-	fmt.Println("=== 错误处理演示 (全部统一 JSON 格式: success=false + error{code,message} + request_id/path/method) ===")
-	fmt.Println("  GET    /demo/errors/bad-request    - 400 参数错误")
-	fmt.Println("  GET    /demo/errors/not-found      - 404 资源不存在")
-	fmt.Println("  GET    /demo/errors/forbidden      - 403 权限错误")
-	fmt.Println("  GET    /demo/errors/validation     - 422 校验失败")
-	fmt.Println("  GET    /demo/errors/conflict       - 409 冲突")
-	fmt.Println("  GET    /demo/errors/custom         - 自定义 AppError (带 detail)")
-	fmt.Println("  GET    /demo/errors/plain-error    - 普通 Go error → 自动转 500")
-	fmt.Println("  GET    /demo/errors/panic          - 业务 panic → Recovery 捕获 → 统一格式")
-	fmt.Println()
-	fmt.Println("=== 静态 vs 参数路由优先级 ===")
-	fmt.Println("  GET    /users/me                   - 静态优先 (如注册)")
-	fmt.Println("  GET    /users/123                  - 参数兜底")
+	fmt.Println("=== 错误处理演示 (全部同一 JSON 结构) ===")
+	fmt.Println("  GET    /demo/errors/bad-request    - 400")
+	fmt.Println("  GET    /demo/errors/not-found      - 404")
+	fmt.Println("  GET    /demo/errors/forbidden      - 403")
+	fmt.Println("  GET    /demo/errors/validation     - 422")
+	fmt.Println("  GET    /demo/errors/conflict       - 409")
+	fmt.Println("  GET    /demo/errors/custom         - 400 + detail")
+	fmt.Println("  GET    /demo/errors/plain-error    - 普通 Go error → 500")
+	fmt.Println("  GET    /demo/errors/panic          - panic → Recovery → 500")
 	fmt.Println()
 	fmt.Println("  Curl 示例:")
-	fmt.Println("    # 401 未登录")
-	fmt.Println("    curl -i http://localhost:8080/api/v1/profile")
-	fmt.Println("    # 200 普通用户登录")
-	fmt.Println("    curl -i -H 'Authorization: Bearer alice' http://localhost:8080/api/v1/profile")
-	fmt.Println("    # 403 普通用户访问 admin")
-	fmt.Println("    curl -i -H 'Authorization: Bearer alice' http://localhost:8080/api/v1/admin/dashboard")
-	fmt.Println("    # 200 admin 登录成功")
-	fmt.Println("    curl -i -H 'Authorization: Bearer admin' http://localhost:8080/api/v1/admin/dashboard")
-	fmt.Println("    # OPTIONS 预检 (无需手动注册)")
-	fmt.Println("    curl -i -X OPTIONS http://localhost:8080/api/v1/profile")
-	fmt.Println("    # HEAD 访问已注册的 GET 路由 (无 body)")
-	fmt.Println("    curl -i -X HEAD http://localhost:8080/health")
-	fmt.Println("    # 查看 metrics (先访问几个错误接口让数据好看点)")
-	fmt.Println("    curl -s http://localhost:8080/debug/metrics | python -m json.tool")
+	fmt.Println("    # 401 没登录访问 debug")
+	fmt.Println("    curl -i http://localhost:8080/debug/metrics")
+	fmt.Println("    # 403 普通用户访问 debug")
+	fmt.Println("    curl -i -H 'Authorization: Bearer alice' http://localhost:8080/debug/metrics")
+	fmt.Println("    # 200 admin 访问 debug")
+	fmt.Println("    curl -s -H 'Authorization: Bearer admin' http://localhost:8080/debug/metrics | python -m json.tool")
+	fmt.Println("    # 路由过滤: 只看带 Auth 的 /api 路由")
+	fmt.Println("    curl -s -H 'Authorization: Bearer admin' 'http://localhost:8080/debug/routes/print?prefix=/api&with_mw=Auth'")
+	fmt.Println("    # 看最近请求 (访问几个错误接口后更好看)")
+	fmt.Println("    curl -s -H 'Authorization: Bearer admin' http://localhost:8080/debug/requests | python -m json.tool")
 	fmt.Println()
 
 	if err := http.ListenAndServe(":8080", r); err != nil {
@@ -216,17 +245,19 @@ func homeHandler(c *ctx.Ctx) {
 			"framework": "Vine",
 			"version":   "1.0.0",
 			"message":   "Welcome to Vine Web Framework",
-			"features": []string{
+			"features":  strings.Join([]string{
 				"Radix tree 路由 (静态 map 索引 O(1))",
 				"路径参数 + 通配符 + 回溯匹配",
 				"洋葱模型中间件 (全局+组级+嵌套)",
 				"Context 数据安全传递",
 				"参数绑定与校验",
-				"统一错误处理 (支持自定义全局 ErrorHandler, 带 request_id/path/method)",
+				"统一错误处理 (自定义全局 ErrorHandler, 带 request_id/method/path)",
 				"Panic 自动恢复",
 				"HEAD 自动复用 GET, OPTIONS 预检自动 CORS",
-				"运行时 metrics /debug/metrics",
-			},
+				"请求追踪 /debug/requests (request_id 贯穿日志)",
+				"指标 /debug/metrics (真实口径: 404/预检/HEAD 全计入)",
+				"路由过滤 /debug/routes?method/prefix/with_mw",
+			}, "\n              • "),
 		},
 	})
 }
