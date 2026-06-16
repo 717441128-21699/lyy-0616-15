@@ -1,8 +1,8 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 
 	"github.com/trae-framework/vine/ctx"
@@ -34,8 +34,32 @@ var users = []User{
 	{ID: 2, Name: "Bob", Email: "bob@example.com", Age: 35},
 }
 
+type unifiedErrorResponse struct {
+	Success bool        `json:"success"`
+	Error   errorDetail `json:"error"`
+}
+
+type errorDetail struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Detail  interface{} `json:"detail,omitempty"`
+}
+
 func main() {
 	r := mux.Default()
+
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := appErrors.FromError(err)
+		resp := unifiedErrorResponse{
+			Success: false,
+			Error: errorDetail{
+				Code:    appErr.Code,
+				Message: appErr.Message,
+				Detail:  appErr.Detail,
+			},
+		}
+		c.JSON(appErr.Code, resp)
+	})
 
 	r.Use(middleware.CORS("*"))
 	r.Use(middleware.Timing())
@@ -43,6 +67,12 @@ func main() {
 	r.GET("/", homeHandler)
 	r.GET("/health", healthHandler)
 	r.GET("/panic", panicHandler)
+
+	r.GET("/debug/routes", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]interface{}{
+			"routes": r.ListRoutes(),
+		})
+	})
 
 	r.GET("/users", listUsersHandler)
 	r.GET("/users/:id", getUserHandler)
@@ -63,22 +93,7 @@ func main() {
 	orders.GET("/:id", getOrderHandler)
 	orders.POST("", createOrderHandler)
 
-	admin := api.Group("/admin", func(c *ctx.Ctx) {
-		log.Println("[admin MW] checking admin role")
-		authVal, ok := c.Get("auth")
-		if !ok {
-			c.Forbidden("admin access required")
-			c.Abort()
-			return
-		}
-		authInfo, ok := authVal.(*middleware.AuthInfo)
-		if !ok || authInfo.Role != "admin" {
-			c.Forbidden("admin role required")
-			c.Abort()
-			return
-		}
-		c.Next()
-	})
+	admin := api.Group("/admin", middleware.Auth("admin"))
 	admin.GET("/dashboard", dashboardHandler)
 	admin.GET("/users", adminListUsersHandler)
 
@@ -89,49 +104,64 @@ func main() {
 	errorsDemo.GET("/validation", demoValidation)
 	errorsDemo.GET("/conflict", demoConflict)
 	errorsDemo.GET("/custom", demoCustomError)
+	errorsDemo.GET("/plain-error", demoPlainError)
+	errorsDemo.GET("/panic", demoPanic)
 
 	fmt.Println("========================================")
 	fmt.Println("  Vine Framework - Example Application  ")
 	fmt.Println("  Listening on :8080                    ")
 	fmt.Println("========================================")
 	fmt.Println()
+	fmt.Println(r.PrintRoutes())
+	fmt.Println()
 	fmt.Println("=== 基础路由 ===")
-	fmt.Println("  GET    /                    - 首页")
-	fmt.Println("  GET    /health              - 健康检查")
-	fmt.Println("  GET    /panic               - Panic 恢复测试")
+	fmt.Println("  GET    /                           - 首页")
+	fmt.Println("  GET    /health                     - 健康检查")
+	fmt.Println("  GET    /panic                      - Panic 恢复测试 (走全局错误处理器)")
+	fmt.Println("  GET    /debug/routes               - 路由调试信息 (JSON)")
 	fmt.Println()
 	fmt.Println("=== 用户 CRUD (参数路由) ===")
-	fmt.Println("  GET    /users               - 列表")
-	fmt.Println("  GET    /users/:id           - 详情")
-	fmt.Println("  POST   /users               - 创建 (JSON body)")
-	fmt.Println("  PUT    /users/:id           - 更新")
-	fmt.Println("  DELETE /users/:id           - 删除")
+	fmt.Println("  GET    /users                      - 列表")
+	fmt.Println("  GET    /users/:id                  - 详情 (返回 NotFound 统一格式)")
+	fmt.Println("  POST   /users                      - 创建 (JSON body, 参数校验)")
+	fmt.Println("  PUT    /users/:id                  - 更新")
+	fmt.Println("  DELETE /users/:id                  - 删除")
 	fmt.Println()
 	fmt.Println("=== 通配符路由 ===")
-	fmt.Println("  GET    /files/*filepath     - 文件路径通配")
+	fmt.Println("  GET    /files/*filepath            - 文件路径通配")
 	fmt.Println()
-	fmt.Println("=== 嵌套路由组 + 中间件 ===")
-	fmt.Println("  GET    /api/v1/profile           - 需要登录 (Bearer token)")
-	fmt.Println("  GET    /api/v1/settings          - 需要登录")
-	fmt.Println("  GET    /api/v1/orders            - 需要登录")
-	fmt.Println("  GET    /api/v1/orders/:id        - 需要登录")
-	fmt.Println("  POST   /api/v1/orders            - 需要登录")
-	fmt.Println("  GET    /api/v1/admin/dashboard   - 需要 admin 角色")
-	fmt.Println("  GET    /api/v1/admin/users       - 需要 admin 角色")
+	fmt.Println("=== 嵌套路由组 + 中间件 (区分 401/403) ===")
+	fmt.Println("  GET    /api/v1/profile             - 需要登录: 无token→401, Bearer xxx→200")
+	fmt.Println("  GET    /api/v1/settings            - 需要登录")
+	fmt.Println("  GET    /api/v1/orders              - 需要登录")
+	fmt.Println("  GET    /api/v1/orders/:id          - 需要登录")
+	fmt.Println("  POST   /api/v1/orders              - 需要登录")
+	fmt.Println("  GET    /api/v1/admin/dashboard     - 需要 admin 角色: Bearer user→403, Bearer admin→200")
+	fmt.Println("  GET    /api/v1/admin/users         - 需要 admin 角色")
 	fmt.Println()
-	fmt.Println("=== 错误处理演示 ===")
-	fmt.Println("  GET    /demo/errors/bad-request   - 400 BadRequest()")
-	fmt.Println("  GET    /demo/errors/not-found     - 404 NotFound()")
-	fmt.Println("  GET    /demo/errors/forbidden     - 403 Forbidden()")
-	fmt.Println("  GET    /demo/errors/validation    - 422 ValidationError()")
-	fmt.Println("  GET    /demo/errors/conflict      - 409 Conflict()")
-	fmt.Println("  GET    /demo/errors/custom        - 自定义 AppError")
+	fmt.Println("=== 错误处理演示 (都走全局统一错误处理器) ===")
+	fmt.Println("  GET    /demo/errors/bad-request    - 400 参数错误")
+	fmt.Println("  GET    /demo/errors/not-found      - 404 资源不存在")
+	fmt.Println("  GET    /demo/errors/forbidden      - 403 权限错误")
+	fmt.Println("  GET    /demo/errors/validation     - 422 校验失败")
+	fmt.Println("  GET    /demo/errors/conflict       - 409 冲突")
+	fmt.Println("  GET    /demo/errors/custom         - 自定义 AppError (带 detail)")
+	fmt.Println("  GET    /demo/errors/plain-error    - 普通 Go error 自动转 500")
+	fmt.Println("  GET    /demo/errors/panic          - 业务 panic 被 Recovery 捕获走统一格式")
 	fmt.Println()
 	fmt.Println("=== 静态 vs 参数路由优先级 ===")
-	fmt.Println("  GET    /users/me                 - 静态优先")
-	fmt.Println("  GET    /users/123                - 参数兜底")
+	fmt.Println("  GET    /users/me                   - 静态优先 (如果注册的话)")
+	fmt.Println("  GET    /users/123                  - 参数兜底")
 	fmt.Println()
-	fmt.Println("提示: 使用 Authorization: Bearer admin 可获得 admin 角色")
+	fmt.Println("  Curl 示例:")
+	fmt.Println("    # 401 未登录")
+	fmt.Println("    curl -i http://localhost:8080/api/v1/profile")
+	fmt.Println("    # 200 普通用户登录")
+	fmt.Println("    curl -i -H 'Authorization: Bearer alice' http://localhost:8080/api/v1/profile")
+	fmt.Println("    # 403 普通用户访问 admin")
+	fmt.Println("    curl -i -H 'Authorization: Bearer alice' http://localhost:8080/api/v1/admin/dashboard")
+	fmt.Println("    # 200 admin 登录成功")
+	fmt.Println("    curl -i -H 'Authorization: Bearer admin' http://localhost:8080/api/v1/admin/dashboard")
 	fmt.Println()
 
 	if err := http.ListenAndServe(":8080", r); err != nil {
@@ -141,24 +171,28 @@ func main() {
 
 func homeHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"framework": "Vine",
-		"version":   "1.0.0",
-		"message":   "Welcome to Vine Web Framework",
-		"features": []string{
-			"Radix tree 路由 (静态 map 索引 O(1))",
-			"路径参数 + 通配符 + 回溯匹配",
-			"洋葱模型中间件 (全局+组级+嵌套)",
-			"Context 数据安全传递",
-			"参数绑定与校验",
-			"统一错误处理",
-			"Panic 自动恢复",
+		"success": true,
+		"data": map[string]interface{}{
+			"framework": "Vine",
+			"version":   "1.0.0",
+			"message":   "Welcome to Vine Web Framework",
+			"features": []string{
+				"Radix tree 路由 (静态 map 索引 O(1))",
+				"路径参数 + 通配符 + 回溯匹配",
+				"洋葱模型中间件 (全局+组级+嵌套)",
+				"Context 数据安全传递",
+				"参数绑定与校验",
+				"统一错误处理 (支持自定义全局 ErrorHandler)",
+				"Panic 自动恢复",
+			},
 		},
 	})
 }
 
 func healthHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"status":    "healthy",
+		"success":    true,
+		"status":     "healthy",
 		"request_id": c.GetString("request_id"),
 	})
 }
@@ -172,10 +206,11 @@ func listUsersHandler(c *ctx.Ctx) {
 	limit := c.QueryInt("limit", 10)
 
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"data":  users,
-		"page":  page,
-		"limit": limit,
-		"total": len(users),
+		"success": true,
+		"data":    users,
+		"page":    page,
+		"limit":   limit,
+		"total":   len(users),
 	})
 }
 
@@ -199,7 +234,10 @@ func getUserHandler(c *ctx.Ctx) {
 		return
 	}
 
-	c.JSON(http.StatusOK, found)
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    found,
+	})
 }
 
 func createUserHandler(c *ctx.Ctx) {
@@ -229,7 +267,10 @@ func createUserHandler(c *ctx.Ctx) {
 	}
 	users = append(users, user)
 
-	c.JSON(http.StatusCreated, user)
+	c.JSON(http.StatusCreated, map[string]interface{}{
+		"success": true,
+		"data":    user,
+	})
 }
 
 func updateUserHandler(c *ctx.Ctx) {
@@ -261,7 +302,10 @@ func updateUserHandler(c *ctx.Ctx) {
 		found.Age = req.Age
 	}
 
-	c.JSON(http.StatusOK, found)
+	c.JSON(http.StatusOK, map[string]interface{}{
+		"success": true,
+		"data":    found,
+	})
 }
 
 func deleteUserHandler(c *ctx.Ctx) {
@@ -270,7 +314,10 @@ func deleteUserHandler(c *ctx.Ctx) {
 	for i, u := range users {
 		if fmt.Sprintf("%d", u.ID) == id {
 			users = append(users[:i], users[i+1:]...)
-			c.JSON(http.StatusOK, map[string]string{"message": "user deleted"})
+			c.JSON(http.StatusOK, map[string]interface{}{
+				"success": true,
+				"message": "user deleted",
+			})
 			return
 		}
 	}
@@ -281,6 +328,7 @@ func deleteUserHandler(c *ctx.Ctx) {
 func fileHandler(c *ctx.Ctx) {
 	filepath := c.Param("filepath")
 	c.JSON(http.StatusOK, map[string]interface{}{
+		"success":  true,
 		"filepath": filepath,
 		"message":  fmt.Sprintf("Accessing file: %s", filepath),
 	})
@@ -291,24 +339,31 @@ func profileHandler(c *ctx.Ctx) {
 	authInfo := authVal.(*middleware.AuthInfo)
 
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"user_id":  authInfo.UserID,
-		"role":     authInfo.Role,
-		"verified": authInfo.Verified,
-		"message":  "This is your profile (api/v1 group)",
+		"success": true,
+		"data": map[string]interface{}{
+			"user_id":  authInfo.UserID,
+			"role":     authInfo.Role,
+			"verified": authInfo.Verified,
+			"message":  "This is your profile (api/v1 group)",
+		},
 	})
 }
 
 func settingsHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"theme":   "dark",
-		"lang":    "zh-CN",
-		"message": "Your settings (api/v1 group)",
+		"success": true,
+		"data": map[string]interface{}{
+			"theme":   "dark",
+			"lang":    "zh-CN",
+			"message": "Your settings (api/v1 group)",
+		},
 	})
 }
 
 func listOrdersHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"orders": []map[string]interface{}{
+		"success": true,
+		"data": []map[string]interface{}{
 			{"id": 1, "product": "laptop", "amount": 5999},
 			{"id": 2, "product": "phone", "amount": 2999},
 		},
@@ -319,36 +374,54 @@ func listOrdersHandler(c *ctx.Ctx) {
 func getOrderHandler(c *ctx.Ctx) {
 	id := c.Param("id")
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"id":       id,
-		"product":  "laptop",
-		"amount":   5999,
-		"status":   "shipped",
-		"message":  "订单详情 (nested orders group)",
+		"success": true,
+		"data": map[string]interface{}{
+			"id":       id,
+			"product":  "laptop",
+			"amount":   5999,
+			"status":   "shipped",
+			"message":  "订单详情 (nested orders group)",
+		},
 	})
 }
 
 func createOrderHandler(c *ctx.Ctx) {
+	var body map[string]interface{}
+	if err := json.NewDecoder(c.Request.Body).Decode(&body); err != nil {
+		c.BadRequestf("invalid json body: %v", err)
+		return
+	}
 	c.JSON(http.StatusCreated, map[string]interface{}{
-		"id":      999,
-		"status":  "created",
-		"message": "订单创建成功",
+		"success": true,
+		"data": map[string]interface{}{
+			"id":      999,
+			"status":  "created",
+			"message": "订单创建成功",
+			"body":    body,
+		},
 	})
 }
 
 func dashboardHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"total_users":   len(users),
-		"total_orders":  2,
-		"revenue":       8998,
-		"uptime":        "running",
-		"message":       "Admin dashboard - 你拥有 admin 权限",
+		"success": true,
+		"data": map[string]interface{}{
+			"total_users":  len(users),
+			"total_orders": 2,
+			"revenue":      8998,
+			"uptime":       "running",
+			"message":      "Admin dashboard - 你拥有 admin 权限",
+		},
 	})
 }
 
 func adminListUsersHandler(c *ctx.Ctx) {
 	c.JSON(http.StatusOK, map[string]interface{}{
-		"users":   users,
-		"message": "管理员视角的用户列表",
+		"success": true,
+		"data": map[string]interface{}{
+			"users":   users,
+			"message": "管理员视角的用户列表",
+		},
 	})
 }
 
@@ -376,10 +449,19 @@ func demoCustomError(c *ctx.Ctx) {
 	err := appErrors.WithDetail(
 		appErrors.ErrBadRequest,
 		map[string]interface{}{
-			"field":   "age",
-			"value":   -1,
-			"reason":  "年龄必须大于0",
+			"field":  "age",
+			"value":  -1,
+			"reason": "年龄必须大于0",
 		},
 	)
 	c.Error(err)
+}
+
+func demoPlainError(c *ctx.Ctx) {
+	err := fmt.Errorf("database connection lost: timeout after 30s")
+	c.HandleError(err)
+}
+
+func demoPanic(c *ctx.Ctx) {
+	panic("oops! something unexpected happened in business logic")
 }

@@ -2,11 +2,14 @@ package mux
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/trae-framework/vine/ctx"
+	"github.com/trae-framework/vine/errors"
 	"github.com/trae-framework/vine/middleware"
 )
 
@@ -401,6 +404,418 @@ func TestNestedGroupWithDifferentDepths(t *testing.T) {
 			if order[i] != v {
 				t.Fatalf("deep: order[%d]=%d, want %d; full=%v", i, order[i], v, order)
 			}
+		}
+	})
+}
+
+type testErrResp struct {
+	Success bool        `json:"success"`
+	Error   testErrBody `json:"error"`
+}
+
+type testErrBody struct {
+	Code    int         `json:"code"`
+	Message string      `json:"message"`
+	Detail  interface{} `json:"detail,omitempty"`
+}
+
+func decodeTestErr(t *testing.T, body string) testErrResp {
+	t.Helper()
+	var resp testErrResp
+	if err := json.Unmarshal([]byte(body), &resp); err != nil {
+		t.Fatalf("failed to decode error response: %v\nbody: %s", err, body)
+	}
+	return resp
+}
+
+func TestGlobalErrorHandler_Custom(t *testing.T) {
+	r := New()
+
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		resp := testErrResp{
+			Success: false,
+			Error: testErrBody{
+				Code:    appErr.Code,
+				Message: appErr.Message,
+				Detail:  appErr.Detail,
+			},
+		}
+		c.JSON(appErr.Code, resp)
+	})
+
+	r.GET("/bad", func(c *ctx.Ctx) {
+		c.BadRequest("param x is required")
+	})
+	r.GET("/notfound", func(c *ctx.Ctx) {
+		c.NotFound("user 999")
+	})
+	r.GET("/forbidden", func(c *ctx.Ctx) {
+		c.Forbidden("admin only")
+	})
+	r.GET("/plain", func(c *ctx.Ctx) {
+		c.HandleError(fmt.Errorf("database down"))
+	})
+
+	t.Run("bad_request_400", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/bad", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("want 400, got %d", w.Code)
+		}
+		resp := decodeTestErr(t, w.Body.String())
+		if resp.Success {
+			t.Fatal("success should be false")
+		}
+		if resp.Error.Code != http.StatusBadRequest {
+			t.Fatalf("want code %d, got %d", http.StatusBadRequest, resp.Error.Code)
+		}
+		if resp.Error.Message != "param x is required" {
+			t.Fatalf("unexpected message: %s", resp.Error.Message)
+		}
+	})
+
+	t.Run("not_found_404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/notfound", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("want 404, got %d", w.Code)
+		}
+		resp := decodeTestErr(t, w.Body.String())
+		if resp.Error.Code != http.StatusNotFound {
+			t.Fatalf("want code %d, got %d", http.StatusNotFound, resp.Error.Code)
+		}
+		if resp.Error.Message != "user 999" {
+			t.Fatalf("unexpected message: %s", resp.Error.Message)
+		}
+	})
+
+	t.Run("forbidden_403", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/forbidden", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("want 403, got %d", w.Code)
+		}
+		resp := decodeTestErr(t, w.Body.String())
+		if resp.Error.Code != http.StatusForbidden {
+			t.Fatalf("want code %d, got %d", http.StatusForbidden, resp.Error.Code)
+		}
+	})
+
+	t.Run("plain_error_becomes_500", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/plain", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("want 500, got %d", w.Code)
+		}
+		resp := decodeTestErr(t, w.Body.String())
+		if resp.Error.Code != http.StatusInternalServerError {
+			t.Fatalf("want code %d, got %d", http.StatusInternalServerError, resp.Error.Code)
+		}
+		if resp.Error.Message != "database down" {
+			t.Fatalf("unexpected message: %s", resp.Error.Message)
+		}
+	})
+}
+
+func TestGlobalErrorHandler_WithRecovery(t *testing.T) {
+	r := New()
+	r.Use(middleware.Recovery())
+
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		resp := testErrResp{
+			Success: false,
+			Error: testErrBody{
+				Code:    appErr.Code,
+				Message: appErr.Message,
+			},
+		}
+		c.JSON(appErr.Code, resp)
+	})
+
+	r.GET("/panic", func(c *ctx.Ctx) {
+		panic("boom! critical failure")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panic", nil)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("want 500 after panic, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("want JSON content-type, got %s", ct)
+	}
+	resp := decodeTestErr(t, w.Body.String())
+	if resp.Success {
+		t.Fatal("success should be false after panic")
+	}
+	if resp.Error.Code != http.StatusInternalServerError {
+		t.Fatalf("want code 500, got %d", resp.Error.Code)
+	}
+	if !strings.Contains(resp.Error.Message, "boom!") {
+		t.Fatalf("panic message should be preserved, got: %s", resp.Error.Message)
+	}
+}
+
+func TestDifferentMethods_Errors(t *testing.T) {
+	r := New()
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		c.JSON(appErr.Code, appErr)
+	})
+
+	r.GET("/resource/:id", func(c *ctx.Ctx) {
+		c.NotFoundf("resource %s not found", c.Param("id"))
+	})
+	r.POST("/resource", func(c *ctx.Ctx) {
+		c.BadRequest("invalid JSON body")
+	})
+	r.PUT("/resource/:id", func(c *ctx.Ctx) {
+		c.ValidationError("field 'name' is required")
+	})
+	r.DELETE("/resource/:id", func(c *ctx.Ctx) {
+		c.Conflict("resource is in use, cannot delete")
+	})
+
+	t.Run("GET_404", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/resource/42", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("GET: want 404, got %d", w.Code)
+		}
+	})
+
+	t.Run("POST_400", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/resource", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("POST: want 400, got %d", w.Code)
+		}
+	})
+
+	t.Run("PUT_422", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("PUT", "/resource/1", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("PUT: want 422, got %d", w.Code)
+		}
+	})
+
+	t.Run("DELETE_409", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("DELETE", "/resource/1", nil)
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusConflict {
+			t.Fatalf("DELETE: want 409, got %d", w.Code)
+		}
+	})
+}
+
+func TestOptionsAndHeadRequests(t *testing.T) {
+	r := New()
+	r.Use(middleware.CORS("*"))
+
+	r.GET("/data", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"hello": "world"})
+	})
+	r.HEAD("/data", func(c *ctx.Ctx) {
+		c.Status(http.StatusOK)
+		c.Header("Content-Length", "18")
+	})
+	r.OPTIONS("/data", func(c *ctx.Ctx) {
+		c.Status(http.StatusNoContent)
+	})
+
+	t.Run("OPTIONS_returns_204", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("OPTIONS", "/data", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS: want 204, got %d", w.Code)
+		}
+		if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+			t.Fatal("missing CORS origin header")
+		}
+	})
+
+	t.Run("HEAD_no_body", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("HEAD", "/data", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("HEAD: want 200, got %d", w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Fatalf("HEAD should have empty body, got %d bytes", w.Body.Len())
+		}
+	})
+}
+
+func TestAuthMiddleware_Distinguishes401And403(t *testing.T) {
+	r := New()
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		c.JSON(appErr.Code, appErr)
+	})
+
+	api := r.Group("/api")
+	api.Use(middleware.Auth(""))
+
+	admin := api.Group("/admin", middleware.Auth("admin"))
+	admin.GET("/dashboard", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"status": "ok"})
+	})
+
+	api.GET("/profile", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"status": "profile"})
+	})
+
+	t.Run("no_token_401", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/profile", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("no token: want 401, got %d", w.Code)
+		}
+		var resp errors.AppError
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if resp.Code != http.StatusUnauthorized {
+			t.Fatalf("body code should be 401, got %d", resp.Code)
+		}
+	})
+
+	t.Run("invalid_format_401", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/profile", nil)
+		req.Header.Set("Authorization", "Token xxx")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("invalid format: want 401, got %d", w.Code)
+		}
+	})
+
+	t.Run("user_token_profile_200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/profile", nil)
+		req.Header.Set("Authorization", "Bearer alice")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("user profile: want 200, got %d", w.Code)
+		}
+	})
+
+	t.Run("user_token_admin_403", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/admin/dashboard", nil)
+		req.Header.Set("Authorization", "Bearer alice")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("user on admin: want 403, got %d", w.Code)
+		}
+		var resp errors.AppError
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("invalid JSON: %v", err)
+		}
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("body code should be 403, got %d", resp.Code)
+		}
+	})
+
+	t.Run("admin_token_admin_200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/admin/dashboard", nil)
+		req.Header.Set("Authorization", "Bearer admin")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("admin on admin: want 200, got %d", w.Code)
+		}
+	})
+}
+
+func TestListRoutes_And_PrintRoutes(t *testing.T) {
+	r := New()
+	r.Use(middleware.Logger())
+	r.Use(middleware.RequestID())
+
+	r.GET("/", func(c *ctx.Ctx) {})
+	r.GET("/health", func(c *ctx.Ctx) {})
+
+	api := r.Group("/api")
+	api.Use(middleware.Auth("user"))
+	api.GET("/profile", func(c *ctx.Ctx) {})
+	api.POST("/orders", func(c *ctx.Ctx) {})
+
+	admin := api.Group("/admin")
+	admin.Use(middleware.Auth("admin"))
+	admin.GET("/dashboard", func(c *ctx.Ctx) {})
+
+	t.Run("ListRoutes_count_and_grouping", func(t *testing.T) {
+		routes := r.ListRoutes()
+		if len(routes) != 5 {
+			t.Fatalf("want 5 routes, got %d", len(routes))
+		}
+
+		m := make(map[string]RouteInfo)
+		for _, rt := range routes {
+			key := rt.Method + " " + rt.Path
+			m[key] = rt
+		}
+
+		if _, ok := m["GET /"]; !ok {
+			t.Fatal("missing GET /")
+		}
+		if rt, ok := m["GET /api/profile"]; !ok {
+			t.Fatal("missing GET /api/profile")
+		} else {
+			if rt.GlobalMwCount != 2 {
+				t.Fatalf("GET /api/profile should have 2 global MW, got %d", rt.GlobalMwCount)
+			}
+			if rt.GroupMwCount < 1 {
+				t.Fatalf("GET /api/profile should have >=1 group MW, got %d", rt.GroupMwCount)
+			}
+		}
+		if rt, ok := m["GET /api/admin/dashboard"]; !ok {
+			t.Fatal("missing GET /api/admin/dashboard")
+		} else {
+			if rt.GroupMwCount < 2 {
+				t.Fatalf("nested admin route should have >=2 group MW, got %d", rt.GroupMwCount)
+			}
+		}
+	})
+
+	t.Run("PrintRoutes_not_empty", func(t *testing.T) {
+		out := r.PrintRoutes()
+		if out == "" || out == "(no routes registered)" {
+			t.Fatal("PrintRoutes should return non-empty table")
+		}
+		if !strings.Contains(out, "METHOD") || !strings.Contains(out, "PATH") {
+			t.Fatalf("PrintRoutes should have table header, got:\n%s", out)
+		}
+		if !strings.Contains(out, "/api/admin/dashboard") {
+			t.Fatalf("PrintRoutes should contain nested route, got:\n%s", out)
 		}
 	})
 }

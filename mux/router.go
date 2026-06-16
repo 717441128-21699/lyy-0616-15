@@ -1,12 +1,18 @@
 package mux
 
 import (
+	"fmt"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/trae-framework/vine/ctx"
+	"github.com/trae-framework/vine/errors"
 	"github.com/trae-framework/vine/middleware"
 	"github.com/trae-framework/vine/radix"
 )
+
+type ErrorHandlerFunc func(*ctx.Ctx, error)
 
 type routeEntry struct {
 	Handler     ctx.HandlerFunc
@@ -14,9 +20,15 @@ type routeEntry struct {
 }
 
 type Router struct {
-	trees      map[string]*radix.Tree
-	middleware []ctx.HandlerFunc
-	notFound   ctx.HandlerFunc
+	trees        map[string]*radix.Tree
+	middleware   []ctx.HandlerFunc
+	notFound     ctx.HandlerFunc
+	errorHandler ErrorHandlerFunc
+}
+
+func defaultErrorHandler(c *ctx.Ctx, err error) {
+	appErr := errors.FromError(err)
+	c.JSON(appErr.Code, appErr)
 }
 
 func New() *Router {
@@ -25,11 +37,16 @@ func New() *Router {
 		notFound: func(c *ctx.Ctx) {
 			c.NotFound("page not found")
 		},
+		errorHandler: defaultErrorHandler,
 	}
 	for _, method := range []string{"GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"} {
 		r.trees[method] = radix.NewTree()
 	}
 	return r
+}
+
+func (r *Router) SetErrorHandler(h ErrorHandlerFunc) {
+	r.errorHandler = h
 }
 
 func (r *Router) Use(mw ...ctx.HandlerFunc) {
@@ -54,6 +71,14 @@ func (r *Router) DELETE(path string, handler ctx.HandlerFunc) {
 
 func (r *Router) PATCH(path string, handler ctx.HandlerFunc) {
 	r.addRoute("PATCH", path, handler, nil)
+}
+
+func (r *Router) HEAD(path string, handler ctx.HandlerFunc) {
+	r.addRoute("HEAD", path, handler, nil)
+}
+
+func (r *Router) OPTIONS(path string, handler ctx.HandlerFunc) {
+	r.addRoute("OPTIONS", path, handler, nil)
 }
 
 func (r *Router) Group(prefix string, handlers ...ctx.HandlerFunc) *Group {
@@ -84,6 +109,10 @@ func (r *Router) SetNotFound(handler ctx.HandlerFunc) {
 func (r *Router) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	c := ctx.New(w, req)
 	defer c.Release()
+
+	c.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		r.errorHandler(c, err)
+	})
 
 	tree, ok := r.trees[req.Method]
 	if !ok {
@@ -128,6 +157,61 @@ func (r *Router) DumpRoutes() map[string]string {
 	return out
 }
 
+type RouteInfo struct {
+	Method           string
+	Path             string
+	GlobalMwCount    int
+	GroupMwCount     int
+	TotalMwCount     int
+	HasHandler       bool
+}
+
+func (r *Router) ListRoutes() []RouteInfo {
+	var routes []RouteInfo
+	for method, tree := range r.trees {
+		entries := tree.Walk()
+		for _, e := range entries {
+			entry, ok := e.Handler.(*routeEntry)
+			if !ok {
+				continue
+			}
+			routes = append(routes, RouteInfo{
+				Method:        method,
+				Path:          e.Path,
+				GlobalMwCount: len(r.middleware),
+				GroupMwCount:  len(entry.Middlewares),
+				TotalMwCount:  len(r.middleware) + len(entry.Middlewares),
+				HasHandler:    entry.Handler != nil,
+			})
+		}
+	}
+	sort.Slice(routes, func(i, j int) bool {
+		if routes[i].Path != routes[j].Path {
+			return routes[i].Path < routes[j].Path
+		}
+		return routes[i].Method < routes[j].Method
+	})
+	return routes
+}
+
+func (r *Router) PrintRoutes() string {
+	routes := r.ListRoutes()
+	if len(routes) == 0 {
+		return "(no routes registered)"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Registered Routes (total: %d, global middleware: %d)\n", len(routes), len(r.middleware)))
+	sb.WriteString(strings.Repeat("-", 90) + "\n")
+	sb.WriteString(fmt.Sprintf("%-7s %-40s %-8s %-8s %s\n", "METHOD", "PATH", "GLOBAL", "GROUP", "TOTAL"))
+	sb.WriteString(strings.Repeat("-", 90) + "\n")
+	for _, rt := range routes {
+		sb.WriteString(fmt.Sprintf("%-7s %-40s %-8d %-8d %d\n",
+			rt.Method, rt.Path, rt.GlobalMwCount, rt.GroupMwCount, rt.TotalMwCount))
+	}
+	return sb.String()
+}
+
 type Group struct {
 	prefix      string
 	router      *Router
@@ -156,6 +240,14 @@ func (g *Group) DELETE(path string, handler ctx.HandlerFunc) {
 
 func (g *Group) PATCH(path string, handler ctx.HandlerFunc) {
 	g.addRoute("PATCH", path, handler)
+}
+
+func (g *Group) HEAD(path string, handler ctx.HandlerFunc) {
+	g.addRoute("HEAD", path, handler)
+}
+
+func (g *Group) OPTIONS(path string, handler ctx.HandlerFunc) {
+	g.addRoute("OPTIONS", path, handler)
 }
 
 func (g *Group) Group(prefix string, handlers ...ctx.HandlerFunc) *Group {

@@ -268,6 +268,38 @@ func (t *Tree) Dump() string {
 	return sb.String()
 }
 
+type WalkEntry struct {
+	Path    string
+	Handler interface{}
+}
+
+func (t *Tree) Walk() []WalkEntry {
+	var results []WalkEntry
+	segments := []string{}
+	t.walkNode(t.root, segments, &results)
+	return results
+}
+
+func (t *Tree) walkNode(n *node, segments []string, results *[]WalkEntry) {
+	if n.handler != nil {
+		path := "/" + strings.Join(segments, "/")
+		if len(segments) == 0 {
+			path = "/"
+		}
+		*results = append(*results, WalkEntry{Path: path, Handler: n.handler})
+	}
+	for _, child := range n.children {
+		seg := child.segment
+		if child.typ == nodeParam {
+			seg = ":" + child.paramName
+		} else if child.typ == nodeWildcard {
+			seg = "*" + child.paramName
+		}
+		newSegs := append(segments, seg)
+		t.walkNode(child, newSegs, results)
+	}
+}
+
 func (t *Tree) dumpNode(n *node, depth int, sb *strings.Builder) {
 	indent := strings.Repeat("  ", depth)
 	typStr := ""

@@ -14,15 +14,16 @@ import (
 )
 
 type Ctx struct {
-	Request  *http.Request
-	Writer   http.ResponseWriter
-	params   radix.Params
-	store    map[string]interface{}
-	status   int
-	written  bool
-	handlers []HandlerFunc
-	index    int
-	mu       sync.RWMutex
+	Request      *http.Request
+	Writer       http.ResponseWriter
+	params       radix.Params
+	store        map[string]interface{}
+	status       int
+	written      bool
+	handlers     []HandlerFunc
+	index        int
+	errorHandler func(*Ctx, error)
+	mu           sync.RWMutex
 }
 
 var ctxPool = sync.Pool{
@@ -42,10 +43,22 @@ func New(w http.ResponseWriter, r *http.Request) *Ctx {
 	c.written = false
 	c.index = -1
 	c.handlers = nil
+	c.errorHandler = defaultCtxErrorHandler
 	for k := range c.store {
 		delete(c.store, k)
 	}
 	return c
+}
+
+func defaultCtxErrorHandler(c *Ctx, err error) {
+	appErr := errors.FromError(err)
+	c.JSON(appErr.Code, appErr)
+}
+
+func (c *Ctx) SetErrorHandler(h func(*Ctx, error)) {
+	if h != nil {
+		c.errorHandler = h
+	}
 }
 
 func (c *Ctx) Release() {
@@ -56,6 +69,7 @@ func (c *Ctx) Release() {
 	c.written = false
 	c.index = -1
 	c.handlers = nil
+	c.errorHandler = nil
 	ctxPool.Put(c)
 }
 
@@ -168,63 +182,71 @@ func (c *Ctx) HTML(code int, html string) {
 }
 
 func (c *Ctx) Error(err *errors.AppError) {
-	c.JSON(err.Code, err)
+	c.errorHandler(c, err)
+}
+
+func (c *Ctx) HandleError(err error) {
+	c.errorHandler(c, err)
 }
 
 func (c *Ctx) Errorf(code int, format string, args ...interface{}) {
-	c.JSON(code, errors.Newf(code, format, args...))
+	c.errorHandler(c, errors.Newf(code, format, args...))
 }
 
 func (c *Ctx) BadRequest(message string) {
-	c.JSON(http.StatusBadRequest, errors.BadRequest(message))
+	c.errorHandler(c, errors.BadRequest(message))
 }
 
 func (c *Ctx) BadRequestf(format string, args ...interface{}) {
-	c.JSON(http.StatusBadRequest, errors.BadRequestf(format, args...))
+	c.errorHandler(c, errors.BadRequestf(format, args...))
 }
 
 func (c *Ctx) Unauthorized(message string) {
-	c.JSON(http.StatusUnauthorized, errors.Unauthorized(message))
+	c.errorHandler(c, errors.Unauthorized(message))
 }
 
 func (c *Ctx) Unauthorizedf(format string, args ...interface{}) {
-	c.JSON(http.StatusUnauthorized, errors.Unauthorizedf(format, args...))
+	c.errorHandler(c, errors.Unauthorizedf(format, args...))
 }
 
 func (c *Ctx) Forbidden(message string) {
-	c.JSON(http.StatusForbidden, errors.Forbidden(message))
+	c.errorHandler(c, errors.Forbidden(message))
 }
 
 func (c *Ctx) Forbiddenf(format string, args ...interface{}) {
-	c.JSON(http.StatusForbidden, errors.Forbiddenf(format, args...))
+	c.errorHandler(c, errors.Forbiddenf(format, args...))
 }
 
 func (c *Ctx) NotFound(message string) {
-	c.JSON(http.StatusNotFound, errors.NotFound(message))
+	c.errorHandler(c, errors.NotFound(message))
 }
 
 func (c *Ctx) NotFoundf(format string, args ...interface{}) {
-	c.JSON(http.StatusNotFound, errors.NotFoundf(format, args...))
+	c.errorHandler(c, errors.NotFoundf(format, args...))
 }
 
 func (c *Ctx) InternalServerError(message string) {
-	c.JSON(http.StatusInternalServerError, errors.Internal(message))
+	c.errorHandler(c, errors.Internal(message))
 }
 
 func (c *Ctx) InternalServerErrorf(format string, args ...interface{}) {
-	c.JSON(http.StatusInternalServerError, errors.Internalf(format, args...))
+	c.errorHandler(c, errors.Internalf(format, args...))
 }
 
 func (c *Ctx) ValidationError(message string) {
-	c.JSON(http.StatusUnprocessableEntity, errors.Validation(message))
+	c.errorHandler(c, errors.Validation(message))
 }
 
 func (c *Ctx) ValidationErrorf(format string, args ...interface{}) {
-	c.JSON(http.StatusUnprocessableEntity, errors.Validationf(format, args...))
+	c.errorHandler(c, errors.Validationf(format, args...))
 }
 
 func (c *Ctx) Conflict(message string) {
-	c.JSON(http.StatusConflict, errors.Conflict(message))
+	c.errorHandler(c, errors.Conflict(message))
+}
+
+func (c *Ctx) Conflictf(format string, args ...interface{}) {
+	c.errorHandler(c, errors.Conflictf(format, args...))
 }
 
 func (c *Ctx) Bind(obj interface{}) error {
