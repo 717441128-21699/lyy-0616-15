@@ -819,3 +819,320 @@ func TestListRoutes_And_PrintRoutes(t *testing.T) {
 		}
 	})
 }
+
+func TestListRoutes_WithMiddlewareNames(t *testing.T) {
+	r := New()
+	r.Use(middleware.Logger())
+	r.Use(middleware.RequestID())
+
+	api := r.Group("/api", middleware.Auth(""))
+	api.GET("/hello", func(c *ctx.Ctx) {})
+
+	admin := api.Group("/admin", middleware.Auth("admin"))
+	admin.GET("/dashboard", func(c *ctx.Ctx) {})
+
+	routes := r.ListRoutes()
+	if len(routes) != 2 {
+		t.Fatalf("want 2 routes, got %d", len(routes))
+	}
+
+	t.Run("global_mw_names", func(t *testing.T) {
+		for _, rt := range routes {
+			if len(rt.GlobalMwNames) != 2 {
+				t.Fatalf("route %s %s: want 2 global mw names, got %d (%v)",
+					rt.Method, rt.Path, len(rt.GlobalMwNames), rt.GlobalMwNames)
+			}
+			if !strings.Contains(rt.GlobalMwNames[0], "Logger") &&
+				!strings.Contains(rt.GlobalMwNames[0], "RequestID") {
+				t.Fatalf("first global mw name should be recognizable, got: %v", rt.GlobalMwNames)
+			}
+		}
+	})
+
+	t.Run("group_mw_names_nested", func(t *testing.T) {
+		m := make(map[string]RouteInfo)
+		for _, rt := range routes {
+			m[rt.Method+" "+rt.Path] = rt
+		}
+
+		apiRoute := m["GET /api/hello"]
+		if len(apiRoute.GroupMwNames) != 1 {
+			t.Fatalf("api/hello should have 1 group mw, got %d: %v",
+				len(apiRoute.GroupMwNames), apiRoute.GroupMwNames)
+		}
+
+		adminRoute := m["GET /api/admin/dashboard"]
+		if len(adminRoute.GroupMwNames) != 2 {
+			t.Fatalf("admin/dashboard should have 2 group mw, got %d: %v",
+				len(adminRoute.GroupMwNames), adminRoute.GroupMwNames)
+		}
+		if !strings.Contains(adminRoute.GroupMwNames[0], "Auth") ||
+			!strings.Contains(adminRoute.GroupMwNames[1], "Auth") {
+			t.Fatalf("nested admin route should show 2 Auth mws, got: %v", adminRoute.GroupMwNames)
+		}
+	})
+
+	t.Run("PrintRoutes_shows_chain", func(t *testing.T) {
+		out := r.PrintRoutes()
+		if !strings.Contains(out, "→") {
+			t.Fatalf("PrintRoutes should show middleware chain with arrows, got:\n%s", out)
+		}
+		if !strings.Contains(out, "▶") {
+			t.Fatalf("PrintRoutes should show handler marker, got:\n%s", out)
+		}
+	})
+}
+
+func TestMetrics_RequestCountAndStatus(t *testing.T) {
+	r := New()
+
+	r.GET("/ok", func(c *ctx.Ctx) {
+		c.String(http.StatusOK, "ok")
+	})
+	r.GET("/err400", func(c *ctx.Ctx) {
+		c.BadRequest("bad")
+	})
+	r.GET("/err404", func(c *ctx.Ctx) {
+		c.NotFound("gone")
+	})
+
+	m0 := r.GetMetrics()
+	if m0.TotalRequests != 0 {
+		t.Fatalf("initial total should be 0, got %d", m0.TotalRequests)
+	}
+
+	for i := 0; i < 3; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/ok", nil)
+		r.ServeHTTP(w, req)
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/err400", nil))
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/err404", nil))
+
+	m1 := r.GetMetrics()
+	if m1.TotalRequests != 5 {
+		t.Fatalf("want total=5, got %d", m1.TotalRequests)
+	}
+	if m1.StatusCounts["200"] != 3 {
+		t.Fatalf("want 3x200, got %d", m1.StatusCounts["200"])
+	}
+	if m1.StatusCounts["400"] != 1 {
+		t.Fatalf("want 1x400, got %d", m1.StatusCounts["400"])
+	}
+	if m1.StatusCounts["404"] != 1 {
+		t.Fatalf("want 1x404, got %d", m1.StatusCounts["404"])
+	}
+	if m1.RouteCount != 3 {
+		t.Fatalf("route count should be 3, got %d", m1.RouteCount)
+	}
+	if m1.UptimeSeconds < 0 {
+		t.Fatalf("uptime should be >= 0, got %v", m1.UptimeSeconds)
+	}
+}
+
+func TestMetrics_RecentErrors(t *testing.T) {
+	r := New()
+
+	r.GET("/err-a", func(c *ctx.Ctx) {
+		c.BadRequest("error A")
+	})
+	r.GET("/err-b", func(c *ctx.Ctx) {
+		c.Forbidden("error B")
+	})
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/err-a", nil))
+	r.ServeHTTP(w, httptest.NewRequest("GET", "/err-b", nil))
+
+	m := r.GetMetrics()
+	if len(m.RecentErrors) != 2 {
+		t.Fatalf("want 2 recent errors, got %d", len(m.RecentErrors))
+	}
+	if m.RecentErrors[0].Code != 400 || m.RecentErrors[0].Message != "error A" {
+		t.Fatalf("first recent error wrong: %+v", m.RecentErrors[0])
+	}
+	if m.RecentErrors[1].Code != 403 || m.RecentErrors[1].Message != "error B" {
+		t.Fatalf("second recent error wrong: %+v", m.RecentErrors[1])
+	}
+	if m.RecentErrors[0].Method != "GET" || m.RecentErrors[0].Path != "/err-a" {
+		t.Fatalf("recent error should carry path/method: %+v", m.RecentErrors[0])
+	}
+}
+
+func TestHEAD_FallbackToGET_NoBody(t *testing.T) {
+	r := New()
+
+	r.GET("/resource", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"hello": "world", "extra": "data"})
+	})
+	r.GET("/empty", func(c *ctx.Ctx) {
+		c.Status(http.StatusNoContent)
+	})
+
+	t.Run("HEAD_uses_GET_handler_no_body", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("HEAD", "/resource", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("HEAD should be 200, got %d", w.Code)
+		}
+		if w.Body.Len() != 0 {
+			t.Fatalf("HEAD response must have empty body, got %d bytes: %s",
+				w.Body.Len(), w.Body.String())
+		}
+		if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+			t.Fatalf("HEAD should copy content-type header, got %q", ct)
+		}
+	})
+
+	t.Run("HEAD_to_noContent", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("HEAD", "/empty", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("HEAD should respect handler status, got %d", w.Code)
+		}
+	})
+}
+
+func TestOPTIONS_AutoCORS_WithoutRegister(t *testing.T) {
+	r := New()
+
+	r.GET("/data", func(c *ctx.Ctx) {})
+
+	t.Run("OPTIONS_registered_path_returns_204_with_CORS_headers", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("OPTIONS", "/data", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS: want 204, got %d", w.Code)
+		}
+		if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+			t.Fatalf("missing Allow-Origin, got: %+v", w.Header())
+		}
+		methods := w.Header().Get("Access-Control-Allow-Methods")
+		if !strings.Contains(methods, "GET") || !strings.Contains(methods, "POST") {
+			t.Fatalf("Allow-Methods should include GET+POST, got %q", methods)
+		}
+		if w.Header().Get("Access-Control-Allow-Headers") == "" {
+			t.Fatal("missing Allow-Headers header")
+		}
+	})
+
+	t.Run("OPTIONS_arbitrary_path_also_CORS", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("OPTIONS", "/never-registered/xyz", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("OPTIONS any path: want 204, got %d", w.Code)
+		}
+		if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+			t.Fatalf("missing Allow-Origin for unregistered path")
+		}
+	})
+}
+
+func TestAuth_Middleware_BearerAdmin_Success(t *testing.T) {
+	r := New()
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		c.JSON(appErr.Code, appErr)
+	})
+
+	api := r.Group("/api")
+	api.Use(middleware.Auth(""))
+
+	admin := api.Group("/admin", middleware.Auth("admin"))
+	admin.GET("/dashboard", func(c *ctx.Ctx) {
+		c.JSON(http.StatusOK, map[string]string{"secret": "admin-only"})
+	})
+
+	t.Run("no_token_401", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/admin/dashboard", nil)
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("no token: want 401, got %d", w.Code)
+		}
+	})
+
+	t.Run("bearer_alice_to_admin_403", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/admin/dashboard", nil)
+		req.Header.Set("Authorization", "Bearer alice")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("alice to admin: want 403, got %d", w.Code)
+		}
+		var resp errors.AppError
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("not valid JSON: %v", err)
+		}
+		if resp.Code != http.StatusForbidden {
+			t.Fatalf("error body code want 403, got %d", resp.Code)
+		}
+	})
+
+	t.Run("bearer_admin_to_admin_200", func(t *testing.T) {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/api/admin/dashboard", nil)
+		req.Header.Set("Authorization", "Bearer admin")
+		r.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("admin to admin: want 200, got %d, body=%s", w.Code, w.Body.String())
+		}
+		if !strings.Contains(w.Body.String(), "admin-only") {
+			t.Fatalf("want admin-only content, got %s", w.Body.String())
+		}
+	})
+}
+
+func TestErrorHandler_RequestIdMethodPath(t *testing.T) {
+	r := New()
+	r.Use(middleware.RequestID())
+
+	r.SetErrorHandler(func(c *ctx.Ctx, err error) {
+		appErr := errors.FromError(err)
+		rid, _ := c.Get("request_id")
+		c.JSON(appErr.Code, map[string]interface{}{
+			"code":       appErr.Code,
+			"message":    appErr.Message,
+			"request_id": rid,
+			"method":     c.Method(),
+			"path":       c.Path(),
+		})
+	})
+
+	r.GET("/boom", func(c *ctx.Ctx) {
+		c.NotFound("boom gone")
+	})
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/boom", nil)
+	r.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v, body=%s", err, w.Body.String())
+	}
+	if resp["method"] != "GET" {
+		t.Fatalf("want method=GET, got %v", resp["method"])
+	}
+	if resp["path"] != "/boom" {
+		t.Fatalf("want path=/boom, got %v", resp["path"])
+	}
+	if resp["request_id"] == nil || resp["request_id"] == "" {
+		t.Fatalf("want non-empty request_id, got %v", resp["request_id"])
+	}
+	if resp["code"].(float64) != 404 {
+		t.Fatalf("want code=404, got %v", resp["code"])
+	}
+}
